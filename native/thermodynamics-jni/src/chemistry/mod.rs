@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod error;
+pub mod functional_group;
 pub mod mixture;
+pub mod molecule;
 pub mod reaction;
 pub mod reactions;
 pub mod registry;
@@ -18,8 +20,8 @@ pub fn destroy_registry_builder() -> ChemistryResult<ChemistryRegistryBuilder> {
 
 #[cfg(test)]
 mod tests {
-    use super::error::ChemistryError;
     use super::destroy_registry_builder;
+    use super::error::ChemistryError;
     use super::mixture::Mixture;
     use super::reaction::Reaction;
     use super::registry::ChemistryRegistryBuilder;
@@ -323,7 +325,10 @@ mod tests {
         let registry = destroy_registry_builder().unwrap().build().unwrap();
 
         assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 119);
-        assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, registry.reactions().count());
+        assert_eq!(
+            DESTROY_REGISTERED_REACTION_COUNT,
+            registry.reactions().count()
+        );
         assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 149);
     }
 
