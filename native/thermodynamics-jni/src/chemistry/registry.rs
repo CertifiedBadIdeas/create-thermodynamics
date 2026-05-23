@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::error::{ChemistryError, ChemistryResult};
-use super::reaction::{Reaction, ReactionId};
+use super::reaction::{Reaction, ReactionId, StoichiometricTerm};
 use super::substance::{Substance, SubstanceId, SubstanceTagId};
 
 const MASS_TOLERANCE_GRAMS_PER_MOL: f64 = 1.0e-6;
@@ -11,6 +11,8 @@ const THERMO_TOLERANCE: f64 = 1.0e-6;
 pub struct ChemistryRegistry {
     substances: BTreeMap<SubstanceId, Substance>,
     reactions: BTreeMap<ReactionId, Reaction>,
+    reaction_index_by_substance: BTreeMap<SubstanceId, BTreeSet<ReactionId>>,
+    unindexed_reaction_ids: BTreeSet<ReactionId>,
     substance_tags: BTreeSet<SubstanceTagId>,
 }
 
@@ -31,8 +33,31 @@ impl ChemistryRegistry {
         self.reactions.values()
     }
 
+    pub fn reaction_candidates_for_substances<'registry, 'substances, I>(
+        &'registry self,
+        substances: I,
+    ) -> Vec<&'registry Reaction>
+    where
+        I: IntoIterator<Item = &'substances SubstanceId>,
+    {
+        let mut reaction_ids = self.unindexed_reaction_ids.clone();
+        for substance_id in substances {
+            if let Some(indexed_reactions) = self.reaction_index_by_substance.get(substance_id) {
+                reaction_ids.extend(indexed_reactions.iter().cloned());
+            }
+        }
+        reaction_ids
+            .into_iter()
+            .filter_map(|reaction_id| self.reactions.get(&reaction_id))
+            .collect()
+    }
+
     pub fn substances(&self) -> impl Iterator<Item = &Substance> {
         self.substances.values()
+    }
+
+    pub fn substance_tags(&self) -> impl Iterator<Item = &SubstanceTagId> {
+        self.substance_tags.iter()
     }
 
     pub fn substance_count(&self) -> usize {
@@ -54,6 +79,14 @@ pub struct ChemistryRegistryBuilder {
 impl ChemistryRegistryBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_registry(registry: &ChemistryRegistry) -> Self {
+        Self {
+            substances: registry.substances.values().cloned().collect(),
+            reactions: registry.reactions.values().cloned().collect(),
+            substance_tags: registry.substance_tags.clone(),
+        }
     }
 
     pub fn substance(mut self, substance: Substance) -> Self {
@@ -90,9 +123,12 @@ impl ChemistryRegistryBuilder {
             }
         }
 
+        let (reaction_index_by_substance, unindexed_reaction_ids) = build_reaction_index(&reactions);
         let registry = ChemistryRegistry {
             substances,
             reactions,
+            reaction_index_by_substance,
+            unindexed_reaction_ids,
             substance_tags: self.substance_tags,
         };
         registry.validate_substance_tags()?;
@@ -156,61 +192,67 @@ impl ChemistryRegistry {
                 }
             }
 
-            let has_catalyst_context = reaction.orders.keys().any(|ordered_substance| {
-                !reaction
-                    .reactants
-                    .iter()
-                    .any(|term| &term.substance_id == ordered_substance)
-            });
+            let external_reactant_charge = reaction
+                .external_reactants
+                .iter()
+                .filter_map(|requirement| {
+                    requirement
+                        .charge
+                        .map(|charge| charge * requirement.moles_per_reaction.round() as i32)
+                })
+                .sum::<i32>();
 
-            if !reaction.has_external_context() && !has_catalyst_context {
-                let reactant_charge = reaction
-                    .reactants
-                    .iter()
-                    .map(|term| {
-                        self.substances[&term.substance_id].charge * term.coefficient as i32
-                    })
-                    .sum::<i32>();
-                let product_charge = reaction
-                    .products
-                    .iter()
-                    .map(|term| {
-                        self.substances[&term.substance_id].charge * term.coefficient as i32
-                    })
-                    .sum::<i32>();
-                if reactant_charge != product_charge && !reaction.allow_charge_imbalance {
-                    return Err(ChemistryError::ChargeNotConserved {
-                        reaction_id: reaction.id.to_string(),
-                        reactants: reactant_charge,
-                        products: product_charge,
-                    });
-                }
+            let reactant_charge = reaction
+                .reactants
+                .iter()
+                .map(|term| self.substances[&term.substance_id].charge * term.coefficient as i32)
+                .sum::<i32>()
+                + external_reactant_charge;
+            let product_charge = reaction
+                .products
+                .iter()
+                .map(|term| self.substances[&term.substance_id].charge * term.coefficient as i32)
+                .sum::<i32>();
+            if reactant_charge != product_charge && !reaction.allow_charge_imbalance {
+                return Err(ChemistryError::ChargeNotConserved {
+                    reaction_id: reaction.id.to_string(),
+                    reactants: reactant_charge,
+                    products: product_charge,
+                });
+            }
 
-                let reactant_mass = reaction
-                    .reactants
-                    .iter()
-                    .map(|term| {
-                        self.substances[&term.substance_id].molar_mass_grams
-                            * term.coefficient as f64
-                    })
-                    .sum::<f64>();
-                let product_mass = reaction
-                    .products
-                    .iter()
-                    .map(|term| {
-                        self.substances[&term.substance_id].molar_mass_grams
-                            * term.coefficient as f64
-                    })
-                    .sum::<f64>();
-                if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
-                    && !reaction.allow_mass_imbalance
-                {
-                    return Err(ChemistryError::MassNotConserved {
-                        reaction_id: reaction.id.to_string(),
-                        reactants: reactant_mass,
-                        products: product_mass,
-                    });
-                }
+            let external_reactant_mass = reaction
+                .external_reactants
+                .iter()
+                .filter_map(|requirement| {
+                    requirement
+                        .molar_mass_grams
+                        .map(|mass| mass * requirement.moles_per_reaction)
+                })
+                .sum::<f64>();
+            let reactant_mass = reaction
+                .reactants
+                .iter()
+                .map(|term| {
+                    self.substances[&term.substance_id].molar_mass_grams * term.coefficient as f64
+                })
+                .sum::<f64>()
+                + external_reactant_mass;
+            let product_mass = reaction
+                .products
+                .iter()
+                .map(|term| {
+                    self.substances[&term.substance_id].molar_mass_grams * term.coefficient as f64
+                })
+                .sum::<f64>();
+            if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
+                && !reaction.allow_mass_imbalance
+            {
+                return Err(ChemistryError::MassNotConserved {
+                    reaction_id: reaction.id.to_string(),
+                    reactants: reactant_mass,
+                    products: product_mass,
+                });
             }
 
             if let Some(reverse_id) = &reaction.reverse_reaction_id {
@@ -224,6 +266,24 @@ impl ChemistryRegistry {
                         reverse_id: reverse_id.to_string(),
                         reason: "reverse reaction must point back to the forward reaction"
                             .to_string(),
+                    });
+                }
+                if stoichiometric_map(&reaction.reactants) != stoichiometric_map(&reverse.products)
+                    || stoichiometric_map(&reaction.products)
+                        != stoichiometric_map(&reverse.reactants)
+                {
+                    return Err(ChemistryError::ReversibleThermodynamicsMismatch {
+                        reaction_id: reaction.id.to_string(),
+                        reverse_id: reverse_id.to_string(),
+                        reason: "reverse reaction must mirror closed reactants and products"
+                            .to_string(),
+                    });
+                }
+                if reaction.requires_uv != reverse.requires_uv {
+                    return Err(ChemistryError::ReversibleThermodynamicsMismatch {
+                        reaction_id: reaction.id.to_string(),
+                        reverse_id: reverse_id.to_string(),
+                        reason: "reverse reaction must carry the same UV requirement".to_string(),
                     });
                 }
                 if (reaction.enthalpy_change_kj_per_mol + reverse.enthalpy_change_kj_per_mol).abs()
@@ -250,4 +310,41 @@ impl ChemistryRegistry {
         }
         Ok(())
     }
+}
+
+fn stoichiometric_map(terms: &[StoichiometricTerm]) -> BTreeMap<SubstanceId, u32> {
+    let mut result = BTreeMap::new();
+    for term in terms {
+        *result.entry(term.substance_id.clone()).or_insert(0) += term.coefficient;
+    }
+    result
+}
+
+fn build_reaction_index(
+    reactions: &BTreeMap<ReactionId, Reaction>,
+) -> (BTreeMap<SubstanceId, BTreeSet<ReactionId>>, BTreeSet<ReactionId>) {
+    let mut by_substance: BTreeMap<SubstanceId, BTreeSet<ReactionId>> = BTreeMap::new();
+    let mut unindexed = BTreeSet::new();
+    for reaction in reactions.values() {
+        let mut substances = BTreeSet::new();
+        for reactant in &reaction.reactants {
+            substances.insert(reactant.substance_id.clone());
+        }
+        for ordered_substance in reaction.orders.keys() {
+            substances.insert(ordered_substance.clone());
+        }
+
+        if substances.is_empty() {
+            unindexed.insert(reaction.id.clone());
+            continue;
+        }
+
+        for substance_id in substances {
+            by_substance
+                .entry(substance_id)
+                .or_default()
+                .insert(reaction.id.clone());
+        }
+    }
+    (by_substance, unindexed)
 }

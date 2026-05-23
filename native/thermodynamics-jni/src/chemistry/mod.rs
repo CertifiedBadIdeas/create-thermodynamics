@@ -1,8 +1,11 @@
 pub mod catalog;
+pub mod dynamic;
 pub mod error;
+pub mod frowns;
 pub mod functional_group;
 pub mod mixture;
 pub mod molecule;
+pub mod organic;
 pub mod reaction;
 pub mod reactions;
 pub mod registry;
@@ -18,6 +21,11 @@ pub fn destroy_registry_builder() -> ChemistryResult<ChemistryRegistryBuilder> {
     reactions::destroy_reactions_registry_builder(builder)
 }
 
+pub fn destroy_registry_with_generated_reactions_builder(
+) -> ChemistryResult<ChemistryRegistryBuilder> {
+    organic::destroy_registry_with_generated_reactions_builder()
+}
+
 #[cfg(test)]
 mod tests {
     use super::destroy_registry_builder;
@@ -25,7 +33,9 @@ mod tests {
     use super::mixture::Mixture;
     use super::reaction::Reaction;
     use super::registry::ChemistryRegistryBuilder;
-    use super::simulation::{react_for_tick, react_until_equilibrium};
+    use super::simulation::{
+        react_for_tick, react_for_tick_with_context, react_until_equilibrium, ReactionContext,
+    };
     use super::substance::{Substance, SubstanceId};
     use super::{DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_REGISTERED_REACTION_COUNT};
 
@@ -166,6 +176,16 @@ mod tests {
                     .reverse_reaction_id("destroy:isomer_a_to_b")
                     .build(),
             )
+            .reaction(
+                Reaction::builder("destroy:display_reversible")
+                    .reactant("destroy:acid", 1, 1)
+                    .product("destroy:isomer_a", 1)
+                    .display_as_reversible()
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .allow_mass_imbalance()
+                    .build(),
+            )
             .build()
             .expect("test registry must be valid")
     }
@@ -262,6 +282,157 @@ mod tests {
     }
 
     #[test]
+    fn display_as_reversible_does_not_disable_reaction() {
+        let registry = test_registry();
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:acid", 0.1)
+            .unwrap();
+
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+
+        assert!(mixture.concentration_of(&"destroy:isomer_a".into()) > 0.0);
+    }
+
+    #[test]
+    fn registry_returns_only_reaction_candidates_for_present_substances() {
+        let registry = test_registry();
+        let hydrogen: SubstanceId = "destroy:hydrogen".into();
+        let proton: SubstanceId = "destroy:proton".into();
+
+        let hydrogen_candidates = registry
+            .reaction_candidates_for_substances([&hydrogen])
+            .into_iter()
+            .map(|reaction| reaction.id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(hydrogen_candidates, vec!["destroy:combustion"]);
+
+        let proton_candidates = registry
+            .reaction_candidates_for_substances([&proton])
+            .into_iter()
+            .map(|reaction| reaction.id.to_string())
+            .collect::<Vec<_>>();
+        assert!(proton_candidates.contains(&"destroy:neutralization".to_string()));
+        assert!(!proton_candidates.contains(&"destroy:combustion".to_string()));
+    }
+
+    #[test]
+    fn uv_context_controls_reaction_rate() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(Substance::new(
+                "destroy:hydrogen",
+                0,
+                2.0,
+                1_000.0,
+                20.0,
+                28.8,
+                900.0,
+            ))
+            .substance(Substance::new(
+                "destroy:oxygen",
+                0,
+                32.0,
+                1_140.0,
+                90.0,
+                29.4,
+                6_820.0,
+            ))
+            .substance(Substance::new(
+                "destroy:water",
+                0,
+                18.0,
+                18_000.0,
+                373.0,
+                75.0,
+                40_650.0,
+            ))
+            .reaction(
+                Reaction::builder("destroy:uv_water")
+                    .reactant("destroy:hydrogen", 2, 1)
+                    .reactant("destroy:oxygen", 1, 1)
+                    .product("destroy:water", 2)
+                    .requires_uv()
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut dark = Mixture::new(298.0).unwrap();
+        dark.add_substance(&registry, "destroy:hydrogen", 1.0)
+            .unwrap();
+        dark.add_substance(&registry, "destroy:oxygen", 1.0)
+            .unwrap();
+        react_for_tick(&registry, &mut dark, 1).unwrap();
+        assert_eq!(dark.concentration_of(&"destroy:water".into()), 0.0);
+
+        let mut lit = dark.clone();
+        let mut context = ReactionContext::default().with_uv_power(1.0).unwrap();
+        react_for_tick_with_context(&registry, &mut lit, &mut context, 1).unwrap();
+        assert!(lit.concentration_of(&"destroy:water".into()) > 0.0);
+    }
+
+    #[test]
+    fn external_reactant_is_consumed_and_catalyst_is_not() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(Substance::new(
+                "destroy:hydrogen",
+                0,
+                2.0,
+                1_000.0,
+                20.0,
+                28.8,
+                900.0,
+            ))
+            .substance(Substance::new(
+                "destroy:water",
+                0,
+                18.0,
+                18_000.0,
+                373.0,
+                75.0,
+                40_650.0,
+            ))
+            .reaction(
+                Reaction::builder("destroy:external_water")
+                    .reactant("destroy:hydrogen", 1, 1)
+                    .product("destroy:water", 1)
+                    .chemical_external_reactant("external:oxygen_atom", 1.0, 16.0, 0)
+                    .chemical_external_catalyst("external:nickel", 1.0, 58.69, 0)
+                    .reaction_result("external:water_result", 1.0)
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:hydrogen", 1.0)
+            .unwrap();
+        let mut context = ReactionContext::default();
+        context
+            .add_external_reactant("external:oxygen_atom", 0.25)
+            .unwrap();
+        context
+            .add_external_catalyst("external:nickel", 1.0)
+            .unwrap();
+
+        react_for_tick_with_context(&registry, &mut mixture, &mut context, 1).unwrap();
+
+        assert_eq!(
+            context
+                .external_reactants
+                .get("external:oxygen_atom")
+                .copied()
+                .unwrap_or(0.0),
+            0.0
+        );
+        assert_eq!(context.external_catalysts["external:nickel"], 1.0);
+        assert!(context.reaction_results["external:water_result"] > 0.0);
+    }
+
+    #[test]
     fn invalid_reaction_with_unknown_substance_fails_registry_build() {
         let error = ChemistryRegistryBuilder::new()
             .substance(Substance::new(
@@ -324,12 +495,39 @@ mod tests {
     fn destroy_reaction_catalog_builds() {
         let registry = destroy_registry_builder().unwrap().build().unwrap();
 
-        assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 119);
+        assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 118);
         assert_eq!(
             DESTROY_REGISTERED_REACTION_COUNT,
             registry.reactions().count()
         );
-        assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 149);
+        assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 155);
+    }
+
+    #[test]
+    fn destroy_reverse_reactions_are_registered_as_real_pairs() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        for id in [
+            "destroy:chlorine_solvation",
+            "destroy:hydroxide_neutralization",
+            "destroy:iodine_dissolution",
+            "destroy:oleum_formation",
+            "destroy:sodium_amalgamization",
+            "destroy:sulfur_trioxide_hydration",
+            "destroy:tetraborate_equilibrium",
+        ] {
+            let forward = registry.reaction(&id.into()).unwrap();
+            let reverse_id = forward
+                .reverse_reaction_id
+                .as_ref()
+                .expect("forward reaction must point at reverse reaction");
+            let reverse = registry.reaction(reverse_id).unwrap();
+            assert_eq!(reverse.reverse_reaction_id.as_ref(), Some(&forward.id));
+            assert!(!reverse.show_in_jei);
+        }
+
+        assert!(registry
+            .reaction(&"destroy:iron_iii_reduction".into())
+            .is_err());
     }
 
     #[test]
