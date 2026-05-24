@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 
 use super::error::{ChemistryError, ChemistryResult};
 use super::frowns::{parse_frowns, write_frowns};
-use super::functional_group::{FunctionalGroup, FunctionalGroupType};
+use super::functional_group::FunctionalGroupType;
 use super::molecule::MolecularStructure;
 use super::organic;
 use super::reaction::{Reaction, ReactionId};
-use super::registry::ChemistryRegistry;
+use super::registry::{ChemistryRegistry, SubstanceIndex};
 use super::substance::{Substance, SubstanceId, SubstanceTagId};
 
 const DEFAULT_DYNAMIC_DENSITY: f64 = 1000.0;
@@ -19,15 +19,78 @@ const MAX_DYNAMIC_WORK_ITEMS: usize = 1_000_000;
 const MAX_DYNAMIC_QUEUE_ITEMS: usize = 100_000;
 const MASS_TOLERANCE_GRAMS_PER_MOL: f64 = 1.0e-6;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct DynamicReactionIndex(usize);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum KnownSubstanceIndex {
+    Static(SubstanceIndex),
+    Dynamic(usize),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GenerationKey {
+    substance: KnownSubstanceIndex,
+    generator: OrganicGeneratorKind,
+    group_index: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum OrganicGeneratorKind {
+    HalideHydroxideSubstitution,
+    HalideAmmoniaSubstitution,
+    HalideCyanideSubstitution,
+    HalideAmineSubstitution,
+    AlcoholOxidation,
+    AlcoholDehydration,
+    ThionylChlorideSubstitution,
+    CarboxylicAcidEsterification,
+    AcylChlorideEsterification,
+    AlkoxideProtonation,
+    NitrileHydrolysis,
+    NitrileHydrogenation,
+    NitroHydrogenation,
+    AcylChlorideHydrolysis,
+    AcylChlorideFormation,
+    AldehydeOxidation,
+    CyanideNucleophilicAddition,
+    WolffKishnerReduction,
+    AmideHydrolysis,
+    AminePhosgenation,
+    CyanamideAddition,
+    IsocyanateHydrolysis,
+    BoraneOxidation,
+    BorateEsterHydrolysis,
+    AlkeneChlorination,
+    AlkeneChlorohydrination,
+    AlkeneHydrolysis,
+    AlkeneHydroborationWithBorane,
+    AlkeneHydrochlorination,
+    AlkeneHydrogenation,
+    AlkeneHydroiodination,
+    AlkeneIodination,
+    AlkyneChlorination,
+    AlkyneChlorohydrination,
+    AlkyneHydrolysis,
+    AlkyneHydroborationWithBorane,
+    AlkyneHydrochlorination,
+    AlkyneHydrogenation,
+    AlkyneHydroiodination,
+    AlkyneIodination,
+}
+
 #[derive(Debug, Clone)]
 pub struct DynamicChemistryRegistry {
     static_registry: ChemistryRegistry,
-    dynamic_substances: BTreeMap<SubstanceId, Substance>,
-    dynamic_reactions: BTreeMap<ReactionId, Reaction>,
-    dynamic_reaction_index_by_substance: BTreeMap<SubstanceId, BTreeSet<ReactionId>>,
-    dynamic_unindexed_reaction_ids: BTreeSet<ReactionId>,
+    dynamic_substances: Vec<Substance>,
+    dynamic_substance_id_to_index: BTreeMap<SubstanceId, usize>,
+    dynamic_reactions: Vec<Reaction>,
+    dynamic_reaction_id_to_index: BTreeMap<ReactionId, DynamicReactionIndex>,
+    dynamic_reaction_index_by_substance: Vec<Vec<DynamicReactionIndex>>,
+    dynamic_unindexed_reaction_indices: Vec<DynamicReactionIndex>,
     canonical_to_id: BTreeMap<String, SubstanceId>,
-    processed_generation_keys: BTreeSet<String>,
+    canonical_by_id: BTreeMap<SubstanceId, String>,
+    processed_generation_keys: BTreeSet<GenerationKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,13 +111,17 @@ impl DynamicChemistryRegistry {
     }
 
     pub fn from_registry(registry: ChemistryRegistry) -> ChemistryResult<Self> {
+        let static_substance_count = registry.substance_count();
         let mut result = Self {
             static_registry: registry,
-            dynamic_substances: BTreeMap::new(),
-            dynamic_reactions: BTreeMap::new(),
-            dynamic_reaction_index_by_substance: BTreeMap::new(),
-            dynamic_unindexed_reaction_ids: BTreeSet::new(),
+            dynamic_substances: Vec::new(),
+            dynamic_substance_id_to_index: BTreeMap::new(),
+            dynamic_reactions: Vec::new(),
+            dynamic_reaction_id_to_index: BTreeMap::new(),
+            dynamic_reaction_index_by_substance: vec![Vec::new(); static_substance_count],
+            dynamic_unindexed_reaction_indices: Vec::new(),
             canonical_to_id: BTreeMap::new(),
+            canonical_by_id: BTreeMap::new(),
             processed_generation_keys: BTreeSet::new(),
         };
         result.rebuild_canonical_index()?;
@@ -66,15 +133,17 @@ impl DynamicChemistryRegistry {
     }
 
     pub fn substance(&self, id: &SubstanceId) -> ChemistryResult<&Substance> {
-        self.dynamic_substances
+        self.dynamic_substance_id_to_index
             .get(id)
+            .and_then(|index| self.dynamic_substances.get(*index))
             .or_else(|| self.static_registry.substance(id).ok())
             .ok_or_else(|| ChemistryError::InvalidMixtureState(format!("unknown substance '{id}'")))
     }
 
     pub fn reaction(&self, id: &ReactionId) -> ChemistryResult<&Reaction> {
-        self.dynamic_reactions
+        self.dynamic_reaction_id_to_index
             .get(id)
+            .and_then(|index| self.dynamic_reactions.get(index.0))
             .or_else(|| self.static_registry.reaction(id).ok())
             .ok_or_else(|| ChemistryError::UnknownReaction(id.to_string()))
     }
@@ -82,13 +151,13 @@ impl DynamicChemistryRegistry {
     pub fn substances(&self) -> impl Iterator<Item = &Substance> {
         self.static_registry
             .substances()
-            .chain(self.dynamic_substances.values())
+            .chain(self.dynamic_substances.iter())
     }
 
     pub fn reactions(&self) -> impl Iterator<Item = &Reaction> {
         self.static_registry
             .reactions()
-            .chain(self.dynamic_reactions.values())
+            .chain(self.dynamic_reactions.iter())
     }
 
     pub fn validate_substance_can_enter_mixture(
@@ -116,11 +185,29 @@ impl DynamicChemistryRegistry {
         I: IntoIterator<Item = &'substances SubstanceId>,
     {
         let substance_ids = substances.into_iter().collect::<Vec<_>>();
-        let mut dynamic_reaction_ids = self.dynamic_unindexed_reaction_ids.clone();
+        let mut seen = vec![false; self.dynamic_reactions.len()];
+        let mut dynamic_reaction_indices = Vec::new();
+        for reaction_index in &self.dynamic_unindexed_reaction_indices {
+            mark_dynamic_reaction_candidate(
+                &mut seen,
+                &mut dynamic_reaction_indices,
+                *reaction_index,
+            );
+        }
         for substance_id in &substance_ids {
-            if let Some(indexed_reactions) = self.dynamic_reaction_index_by_substance.get(substance_id)
-            {
-                dynamic_reaction_ids.extend(indexed_reactions.iter().cloned());
+            let Some(substance_index) = self.known_substance_index(substance_id) else {
+                continue;
+            };
+            let slot =
+                known_substance_slot(self.static_registry.substance_count(), substance_index);
+            if let Some(indexed_reactions) = self.dynamic_reaction_index_by_substance.get(slot) {
+                for reaction_index in indexed_reactions {
+                    mark_dynamic_reaction_candidate(
+                        &mut seen,
+                        &mut dynamic_reaction_indices,
+                        *reaction_index,
+                    );
+                }
             }
         }
         let mut result = self
@@ -129,9 +216,9 @@ impl DynamicChemistryRegistry {
             .into_iter()
             .collect::<Vec<_>>();
         result.extend(
-            dynamic_reaction_ids
+            dynamic_reaction_indices
                 .into_iter()
-                .filter_map(|reaction_id| self.dynamic_reactions.get(&reaction_id)),
+                .filter_map(|reaction_index| self.dynamic_reaction_by_index(reaction_index)),
         );
         result
     }
@@ -150,8 +237,7 @@ impl DynamicChemistryRegistry {
         }
         let substance = build_dynamic_substance(canonical.clone(), structure)?;
         let id = substance.id.clone();
-        self.add_dynamic_substance(substance)?;
-        self.canonical_to_id.insert(canonical, id.clone());
+        self.add_dynamic_substance_with_canonical(substance, Some(canonical))?;
         Ok(id)
     }
 
@@ -296,7 +382,7 @@ impl DynamicChemistryRegistry {
                 });
             }
 
-            let available_substances = self.substances().cloned().collect::<Vec<_>>();
+            let available_substances = self.substances().collect::<Vec<_>>();
             let generated = organic::generate_organic_reactions_for_substances(
                 &available_substances,
                 &unprocessed_seeds,
@@ -322,7 +408,9 @@ impl DynamicChemistryRegistry {
                     skipped_duplicates += 1;
                     continue;
                 }
-                self.canonical_to_id.insert(canonical, substance.id.clone());
+                self.canonical_to_id
+                    .insert(canonical.clone(), substance.id.clone());
+                self.canonical_by_id.insert(substance.id.clone(), canonical);
                 queue.insert(substance.id.clone());
                 scope.insert(substance.id.clone());
                 if queue.len() > MAX_DYNAMIC_QUEUE_ITEMS {
@@ -380,6 +468,7 @@ impl DynamicChemistryRegistry {
 
     fn rebuild_canonical_index(&mut self) -> ChemistryResult<()> {
         self.canonical_to_id.clear();
+        self.canonical_by_id.clear();
         let canonical_entries = self
             .substances()
             .filter_map(|substance| {
@@ -391,15 +480,28 @@ impl DynamicChemistryRegistry {
             .map(|(id, structure)| write_frowns(structure).map(|canonical| (canonical, id)))
             .collect::<ChemistryResult<Vec<_>>>()?;
         for (canonical, id) in canonical_entries {
-            self.canonical_to_id.entry(canonical).or_insert(id);
+            self.canonical_to_id
+                .entry(canonical.clone())
+                .or_insert_with(|| id.clone());
+            self.canonical_by_id.insert(id, canonical);
         }
         Ok(())
     }
 
     fn add_dynamic_substance(&mut self, substance: Substance) -> ChemistryResult<()> {
+        self.add_dynamic_substance_with_canonical(substance, None)
+    }
+
+    fn add_dynamic_substance_with_canonical(
+        &mut self,
+        substance: Substance,
+        canonical: Option<String>,
+    ) -> ChemistryResult<()> {
         substance.validate()?;
         if self.static_registry.substance(&substance.id).is_ok()
-            || self.dynamic_substances.contains_key(&substance.id)
+            || self
+                .dynamic_substance_id_to_index
+                .contains_key(&substance.id)
         {
             return Err(ChemistryError::DuplicateSubstance(substance.id.to_string()));
         }
@@ -411,24 +513,76 @@ impl DynamicChemistryRegistry {
                 });
             }
         }
-        self.dynamic_substances.insert(substance.id.clone(), substance);
+        let canonical = match (canonical, substance.molecular_structure.as_ref()) {
+            (Some(canonical), _) => Some(canonical),
+            (None, Some(structure)) => Some(write_frowns(structure)?),
+            (None, None) => None,
+        };
+        if let Some(canonical) = canonical {
+            self.canonical_to_id
+                .entry(canonical.clone())
+                .or_insert_with(|| substance.id.clone());
+            self.canonical_by_id.insert(substance.id.clone(), canonical);
+        }
+        let substance_index = self.dynamic_substances.len();
+        self.dynamic_substance_id_to_index
+            .insert(substance.id.clone(), substance_index);
+        self.dynamic_substances.push(substance);
+        self.dynamic_reaction_index_by_substance.push(Vec::new());
         Ok(())
     }
 
     fn add_dynamic_reaction(&mut self, reaction: Reaction) -> ChemistryResult<()> {
         if self.static_registry.reaction(&reaction.id).is_ok()
-            || self.dynamic_reactions.contains_key(&reaction.id)
+            || self.dynamic_reaction_id_to_index.contains_key(&reaction.id)
         {
             return Err(ChemistryError::DuplicateReaction(reaction.id.to_string()));
         }
         self.validate_dynamic_reaction(&reaction)?;
+        let reaction_index = DynamicReactionIndex(self.dynamic_reactions.len());
+        let indexed_substances = self.indexed_substances_for_reaction(&reaction);
         index_dynamic_reaction(
             &mut self.dynamic_reaction_index_by_substance,
-            &mut self.dynamic_unindexed_reaction_ids,
-            &reaction,
+            &mut self.dynamic_unindexed_reaction_indices,
+            self.static_registry.substance_count(),
+            reaction_index,
+            indexed_substances,
         );
-        self.dynamic_reactions.insert(reaction.id.clone(), reaction);
+        self.dynamic_reaction_id_to_index
+            .insert(reaction.id.clone(), reaction_index);
+        self.dynamic_reactions.push(reaction);
         Ok(())
+    }
+
+    fn dynamic_reaction_by_index(&self, index: DynamicReactionIndex) -> Option<&Reaction> {
+        self.dynamic_reactions.get(index.0)
+    }
+
+    fn known_substance_index(&self, substance_id: &SubstanceId) -> Option<KnownSubstanceIndex> {
+        self.dynamic_substance_id_to_index
+            .get(substance_id)
+            .copied()
+            .map(KnownSubstanceIndex::Dynamic)
+            .or_else(|| {
+                self.static_registry
+                    .substance_index(substance_id)
+                    .map(KnownSubstanceIndex::Static)
+            })
+    }
+
+    fn indexed_substances_for_reaction(&self, reaction: &Reaction) -> Vec<KnownSubstanceIndex> {
+        let mut substances = Vec::new();
+        for reactant in &reaction.reactants {
+            if let Some(substance_index) = self.known_substance_index(&reactant.substance_id) {
+                insert_sorted_unique(&mut substances, substance_index);
+            }
+        }
+        for ordered_substance in reaction.orders.keys() {
+            if let Some(substance_index) = self.known_substance_index(ordered_substance) {
+                insert_sorted_unique(&mut substances, substance_index);
+            }
+        }
+        substances
     }
 
     fn validate_dynamic_reaction(&self, reaction: &Reaction) -> ChemistryResult<()> {
@@ -494,9 +648,8 @@ impl DynamicChemistryRegistry {
             .reactants
             .iter()
             .map(|term| {
-                self.substance(&term.substance_id).map(|substance| {
-                    substance.molar_mass_grams * term.coefficient as f64
-                })
+                self.substance(&term.substance_id)
+                    .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
             })
             .sum::<ChemistryResult<f64>>()?
             + external_reactant_mass;
@@ -504,9 +657,8 @@ impl DynamicChemistryRegistry {
             .products
             .iter()
             .map(|term| {
-                self.substance(&term.substance_id).map(|substance| {
-                    substance.molar_mass_grams * term.coefficient as f64
-                })
+                self.substance(&term.substance_id)
+                    .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
             })
             .sum::<ChemistryResult<f64>>()?;
         if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
@@ -536,122 +688,140 @@ impl DynamicChemistryRegistry {
     fn generation_keys_for_substance(
         &self,
         substance_id: &SubstanceId,
-    ) -> ChemistryResult<BTreeSet<String>> {
+    ) -> ChemistryResult<BTreeSet<GenerationKey>> {
+        let substance_index = self.known_substance_index(substance_id).ok_or_else(|| {
+            ChemistryError::InvalidMixtureState(format!("unknown substance '{substance_id}'"))
+        })?;
         let substance = self.substance(substance_id)?;
-        let Some(structure) = &substance.molecular_structure else {
+        if substance.molecular_structure.is_none() {
             return Ok(BTreeSet::new());
-        };
-        let canonical = write_frowns(structure)?;
+        }
         let mut keys = BTreeSet::new();
-        for group in &substance.functional_groups {
+        for (group_index, group) in substance.functional_groups.iter().enumerate() {
             for generator in generators_for_group(&group.group_type) {
-                keys.insert(format!(
-                    "{canonical}|{generator}|{}",
-                    functional_group_key(structure, group)
-                ));
+                keys.insert(GenerationKey {
+                    substance: substance_index,
+                    generator: *generator,
+                    group_index,
+                });
             }
         }
         Ok(keys)
     }
 }
 
-fn generators_for_group(group_type: &FunctionalGroupType) -> &'static [&'static str] {
+fn generators_for_group(group_type: &FunctionalGroupType) -> &'static [OrganicGeneratorKind] {
     match group_type {
         FunctionalGroupType::Halide => &[
-            "halide_hydroxide_substitution",
-            "halide_ammonia_substitution",
-            "halide_cyanide_substitution",
-            "halide_amine_substitution",
+            OrganicGeneratorKind::HalideHydroxideSubstitution,
+            OrganicGeneratorKind::HalideAmmoniaSubstitution,
+            OrganicGeneratorKind::HalideCyanideSubstitution,
+            OrganicGeneratorKind::HalideAmineSubstitution,
         ],
         FunctionalGroupType::Alcohol => &[
-            "alcohol_oxidation",
-            "alcohol_dehydration",
-            "thionyl_chloride_substitution",
-            "carboxylic_acid_esterification",
-            "acyl_chloride_esterification",
+            OrganicGeneratorKind::AlcoholOxidation,
+            OrganicGeneratorKind::AlcoholDehydration,
+            OrganicGeneratorKind::ThionylChlorideSubstitution,
+            OrganicGeneratorKind::CarboxylicAcidEsterification,
+            OrganicGeneratorKind::AcylChlorideEsterification,
         ],
-        FunctionalGroupType::Alkoxide => &["alkoxide_protonation"],
-        FunctionalGroupType::Nitrile => &["nitrile_hydrolysis", "nitrile_hydrogenation"],
-        FunctionalGroupType::Nitro => &["nitro_hydrogenation"],
-        FunctionalGroupType::AcylChloride => {
-            &["acyl_chloride_hydrolysis", "acyl_chloride_esterification"]
-        }
-        FunctionalGroupType::CarboxylicAcid => {
-            &["acyl_chloride_formation", "carboxylic_acid_esterification"]
-        }
+        FunctionalGroupType::Alkoxide => &[OrganicGeneratorKind::AlkoxideProtonation],
+        FunctionalGroupType::Nitrile => &[
+            OrganicGeneratorKind::NitrileHydrolysis,
+            OrganicGeneratorKind::NitrileHydrogenation,
+        ],
+        FunctionalGroupType::Nitro => &[OrganicGeneratorKind::NitroHydrogenation],
+        FunctionalGroupType::AcylChloride => &[
+            OrganicGeneratorKind::AcylChlorideHydrolysis,
+            OrganicGeneratorKind::AcylChlorideEsterification,
+        ],
+        FunctionalGroupType::CarboxylicAcid => &[
+            OrganicGeneratorKind::AcylChlorideFormation,
+            OrganicGeneratorKind::CarboxylicAcidEsterification,
+        ],
         FunctionalGroupType::Carbonyl => &[
-            "aldehyde_oxidation",
-            "cyanide_nucleophilic_addition",
-            "wolff_kishner_reduction",
+            OrganicGeneratorKind::AldehydeOxidation,
+            OrganicGeneratorKind::CyanideNucleophilicAddition,
+            OrganicGeneratorKind::WolffKishnerReduction,
         ],
-        FunctionalGroupType::UnsubstitutedAmide => &["amide_hydrolysis"],
-        FunctionalGroupType::PrimaryAmine => &["amine_phosgenation"],
-        FunctionalGroupType::NonTertiaryAmine => {
-            &["cyanamide_addition", "halide_amine_substitution"]
-        }
-        FunctionalGroupType::Isocyanate => &["isocyanate_hydrolysis"],
-        FunctionalGroupType::Borane => &["borane_oxidation"],
-        FunctionalGroupType::BorateEster => &["borate_ester_hydrolysis"],
+        FunctionalGroupType::UnsubstitutedAmide => &[OrganicGeneratorKind::AmideHydrolysis],
+        FunctionalGroupType::PrimaryAmine => &[OrganicGeneratorKind::AminePhosgenation],
+        FunctionalGroupType::NonTertiaryAmine => &[
+            OrganicGeneratorKind::CyanamideAddition,
+            OrganicGeneratorKind::HalideAmineSubstitution,
+        ],
+        FunctionalGroupType::Isocyanate => &[OrganicGeneratorKind::IsocyanateHydrolysis],
+        FunctionalGroupType::Borane => &[OrganicGeneratorKind::BoraneOxidation],
+        FunctionalGroupType::BorateEster => &[OrganicGeneratorKind::BorateEsterHydrolysis],
         FunctionalGroupType::Alkene => &[
-            "alkene_chlorination",
-            "alkene_chlorohydrination",
-            "alkene_hydrolysis",
-            "alkene_hydroboration_with_borane",
-            "alkene_hydrochlorination",
-            "alkene_hydrogenation",
-            "alkene_hydroiodination",
-            "alkene_iodination",
+            OrganicGeneratorKind::AlkeneChlorination,
+            OrganicGeneratorKind::AlkeneChlorohydrination,
+            OrganicGeneratorKind::AlkeneHydrolysis,
+            OrganicGeneratorKind::AlkeneHydroborationWithBorane,
+            OrganicGeneratorKind::AlkeneHydrochlorination,
+            OrganicGeneratorKind::AlkeneHydrogenation,
+            OrganicGeneratorKind::AlkeneHydroiodination,
+            OrganicGeneratorKind::AlkeneIodination,
         ],
         FunctionalGroupType::Alkyne => &[
-            "alkyne_chlorination",
-            "alkyne_chlorohydrination",
-            "alkyne_hydrolysis",
-            "alkyne_hydroboration_with_borane",
-            "alkyne_hydrochlorination",
-            "alkyne_hydrogenation",
-            "alkyne_hydroiodination",
-            "alkyne_iodination",
+            OrganicGeneratorKind::AlkyneChlorination,
+            OrganicGeneratorKind::AlkyneChlorohydrination,
+            OrganicGeneratorKind::AlkyneHydrolysis,
+            OrganicGeneratorKind::AlkyneHydroborationWithBorane,
+            OrganicGeneratorKind::AlkyneHydrochlorination,
+            OrganicGeneratorKind::AlkyneHydrogenation,
+            OrganicGeneratorKind::AlkyneHydroiodination,
+            OrganicGeneratorKind::AlkyneIodination,
         ],
         _ => &[],
     }
 }
 
-fn functional_group_key(structure: &MolecularStructure, group: &FunctionalGroup) -> String {
-    let mut atoms = group
-        .atoms
-        .iter()
-        .map(|index| {
-            let atom = &structure.atoms[*index];
-            format!("{}:{}:{:.3}", index, atom.element, atom.charge)
-        })
-        .collect::<Vec<_>>();
-    atoms.sort();
-    format!("{:?}|{}", group.group_type, atoms.join(","))
-}
-
 fn index_dynamic_reaction(
-    by_substance: &mut BTreeMap<SubstanceId, BTreeSet<ReactionId>>,
-    unindexed: &mut BTreeSet<ReactionId>,
-    reaction: &Reaction,
+    by_substance: &mut Vec<Vec<DynamicReactionIndex>>,
+    unindexed: &mut Vec<DynamicReactionIndex>,
+    static_substance_count: usize,
+    reaction_index: DynamicReactionIndex,
+    substances: Vec<KnownSubstanceIndex>,
 ) {
-    let mut substances = BTreeSet::new();
-    for reactant in &reaction.reactants {
-        substances.insert(reactant.substance_id.clone());
-    }
-    for ordered_substance in reaction.orders.keys() {
-        substances.insert(ordered_substance.clone());
-    }
-
     if substances.is_empty() {
-        unindexed.insert(reaction.id.clone());
+        unindexed.push(reaction_index);
         return;
     }
 
-    for substance_id in substances {
-        by_substance
-            .entry(substance_id)
-            .or_default()
-            .insert(reaction.id.clone());
+    for substance in substances {
+        let slot = known_substance_slot(static_substance_count, substance);
+        if by_substance.len() <= slot {
+            by_substance.resize(slot + 1, Vec::new());
+        }
+        by_substance[slot].push(reaction_index);
+    }
+}
+
+fn known_substance_slot(static_substance_count: usize, substance: KnownSubstanceIndex) -> usize {
+    match substance {
+        KnownSubstanceIndex::Static(index) => index.as_usize(),
+        KnownSubstanceIndex::Dynamic(index) => static_substance_count + index,
+    }
+}
+
+fn insert_sorted_unique<T: Ord + Copy>(values: &mut Vec<T>, value: T) {
+    match values.binary_search(&value) {
+        Ok(_) => {}
+        Err(index) => values.insert(index, value),
+    }
+}
+
+fn mark_dynamic_reaction_candidate(
+    seen: &mut [bool],
+    result: &mut Vec<DynamicReactionIndex>,
+    reaction_index: DynamicReactionIndex,
+) {
+    if let Some(slot) = seen.get_mut(reaction_index.0) {
+        if !*slot {
+            *slot = true;
+            result.push(reaction_index);
+        }
     }
 }
 
@@ -695,6 +865,12 @@ fn estimate_dynamic_boiling_point(molar_mass_grams: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_key_is_compact_and_structural() {
+        assert!(std::mem::size_of::<GenerationKey>() <= 32);
+    }
+
     #[test]
     fn resolves_known_substance_by_frowns() {
         let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
@@ -709,6 +885,26 @@ mod tests {
         let second = registry.resolve_frowns("CCCCCCCC").unwrap();
         assert_eq!(first, second);
         assert!(first.as_str().starts_with("destroy:linear:"));
+    }
+
+    #[test]
+    fn canonical_codes_are_cached_for_static_and_dynamic_substances() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        assert_eq!(
+            registry.canonical_to_id["destroy:linear:C(=O)(C)(C)"].as_str(),
+            "destroy:acetone"
+        );
+        assert_eq!(
+            registry.canonical_by_id[&SubstanceId::from("destroy:acetone")],
+            "destroy:linear:C(=O)(C)(C)"
+        );
+
+        let dynamic = registry.resolve_frowns("CCCCCCCC").unwrap();
+        let cached = registry.canonical_by_id[&dynamic].clone();
+        let repeated = registry.resolve_frowns("CCCCCCCC").unwrap();
+
+        assert_eq!(dynamic, repeated);
+        assert_eq!(registry.canonical_to_id[&cached], dynamic);
     }
 
     #[test]
