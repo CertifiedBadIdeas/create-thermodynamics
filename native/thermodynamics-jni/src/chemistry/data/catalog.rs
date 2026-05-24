@@ -2,8 +2,10 @@ use super::error::{ChemistryError, ChemistryResult};
 use super::molecule::{
     parse_java_structure, parse_legacy_structure, MolecularStructure, MolecularSummary,
 };
-use super::registry::ChemistryRegistryBuilder;
-use super::substance::{Substance, SubstanceId, SubstanceTagId};
+use super::registry::{ChemistryRegistryBuilder, GasSolubilityModel, SolventMiscibility};
+use super::substance::{
+    LiquidPhasePreference, Substance, SubstanceId, SubstancePhaseProperties, SubstanceTagId,
+};
 
 const DEFAULT_DENSITY_GRAMS_PER_BUCKET: f64 = 1000.0;
 const DEFAULT_MOLAR_HEAT_CAPACITY: f64 = 100.0;
@@ -35,7 +37,49 @@ pub fn destroy_substances_registry_builder() -> ChemistryResult<ChemistryRegistr
     for raw in DESTROY_SUBSTANCES {
         builder = builder.substance(raw.to_substance()?);
     }
+    builder = register_phase_tables(builder);
     Ok(builder)
+}
+
+fn register_phase_tables(builder: ChemistryRegistryBuilder) -> ChemistryRegistryBuilder {
+    builder
+        .gas_solubility(
+            "destroy:oxygen",
+            GasSolubilityModel::Henry {
+                henry_mol_per_bucket_pascal: 1.3e-8,
+                temperature_kelvin: 298.0,
+                salting_out_coefficient: 0.12,
+                transfer_coefficient_per_tick: 0.15,
+                estimated: true,
+            },
+        )
+        .gas_solubility(
+            "destroy:hydrogen",
+            GasSolubilityModel::Henry {
+                henry_mol_per_bucket_pascal: 7.8e-9,
+                temperature_kelvin: 298.0,
+                salting_out_coefficient: 0.08,
+                transfer_coefficient_per_tick: 0.15,
+                estimated: true,
+            },
+        )
+        .solvent_miscibility(
+            "destroy:water",
+            "destroy:ethanol",
+            SolventMiscibility::FullyMiscible,
+        )
+        .solvent_miscibility(
+            "destroy:water",
+            "destroy:acetone",
+            SolventMiscibility::FullyMiscible,
+        )
+        .solvent_miscibility(
+            "destroy:water",
+            "destroy:chloroform",
+            SolventMiscibility::PartiallyMiscible {
+                limit_mol_per_bucket: 0.1,
+            },
+        )
 }
 
 impl RawSubstance {
@@ -78,6 +122,7 @@ impl RawSubstance {
             molar_heat_capacity,
             DEFAULT_LATENT_HEAT,
         )
+        .with_phase_properties(estimate_phase_properties(self.id, &summary, self.tags))
         .with_catalog_metadata(
             self.structure_code
                 .or(self.java_structure_code)
@@ -88,6 +133,47 @@ impl RawSubstance {
         )
         .with_molecular_structure(structure))
     }
+}
+
+fn estimate_phase_properties(
+    id: &str,
+    summary: &MolecularSummary,
+    tags: &[&str],
+) -> SubstancePhaseProperties {
+    if id == "water" {
+        return SubstancePhaseProperties::aqueous_unlimited();
+    }
+    if matches!(id, "proton" | "hydroxide") {
+        return SubstancePhaseProperties {
+            preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+            aqueous_solubility_mol_per_bucket: None,
+            organic_solubility_mol_per_bucket: Some(0.0),
+            can_precipitate: false,
+            can_form_liquid_phase: true,
+        };
+    }
+    if summary.charge != 0 {
+        return SubstancePhaseProperties {
+            preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+            aqueous_solubility_mol_per_bucket: Some(10.0),
+            organic_solubility_mol_per_bucket: Some(0.0),
+            can_precipitate: true,
+            can_form_liquid_phase: false,
+        };
+    }
+    if tags.contains(&"solvent") {
+        return SubstancePhaseProperties::organic_unlimited(0.1);
+    }
+    if id.ends_with("_acid") || id.contains("acid") || id == "ammonia" {
+        return SubstancePhaseProperties {
+            preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+            aqueous_solubility_mol_per_bucket: None,
+            organic_solubility_mol_per_bucket: Some(0.25),
+            can_precipitate: false,
+            can_form_liquid_phase: true,
+        };
+    }
+    SubstancePhaseProperties::organic_unlimited(0.05)
 }
 
 fn estimate_boiling_point(molar_mass_grams: f64) -> f64 {
