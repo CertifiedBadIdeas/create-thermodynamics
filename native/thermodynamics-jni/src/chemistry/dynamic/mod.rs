@@ -3,11 +3,12 @@ use std::collections::VecDeque;
 
 use super::error::{ChemistryError, ChemistryResult};
 use super::frowns::{parse_frowns, write_frowns};
-use super::functional_group::FunctionalGroupType;
-use super::molecule::MolecularStructure;
+use super::functional_group::{FunctionalGroup, FunctionalGroupType};
+use super::molecule::{MolecularEditor, MolecularStructure, Stereochemistry};
 use super::organic::{self, GroupParticipant, OrganicGenerationSpace};
 use super::reaction::{Reaction, ReactionId};
-use super::registry::{ChemistryRegistry, SubstanceIndex};
+use super::registry::{ChemistryRegistry, ChemistryRegistryBuilder, SubstanceIndex};
+use super::solution::AcidBaseSpec;
 use super::substance::{
     LiquidPhasePreference, Substance, SubstanceId, SubstancePhaseProperties, SubstanceTagId,
 };
@@ -151,6 +152,7 @@ pub struct DynamicChemistryRegistry {
     group_index: Vec<GroupBucket>,
     group_handles_by_substance: Vec<Vec<GroupHandle>>,
     processed_generation_masks: Vec<Vec<u64>>,
+    dynamic_acid_base_specs: Vec<AcidBaseSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +187,7 @@ impl DynamicChemistryRegistry {
             group_index: Vec::new(),
             group_handles_by_substance: vec![Vec::new(); static_substance_count],
             processed_generation_masks: vec![Vec::new(); static_substance_count],
+            dynamic_acid_base_specs: Vec::new(),
         };
         result.rebuild_canonical_index()?;
         result.rebuild_group_index();
@@ -193,6 +196,20 @@ impl DynamicChemistryRegistry {
 
     pub fn static_registry(&self) -> &ChemistryRegistry {
         &self.static_registry
+    }
+
+    pub fn to_registry(&self) -> ChemistryResult<ChemistryRegistry> {
+        let mut builder = ChemistryRegistryBuilder::from_registry(&self.static_registry);
+        for substance in &self.dynamic_substances {
+            builder = builder.substance(substance.clone());
+        }
+        for reaction in &self.dynamic_reactions {
+            builder = builder.reaction(reaction.clone());
+        }
+        for spec in &self.dynamic_acid_base_specs {
+            builder = builder.acid_base_pair(spec.clone());
+        }
+        builder.build()
     }
 
     pub fn substance(&self, id: &SubstanceId) -> ChemistryResult<&Substance> {
@@ -606,6 +623,72 @@ impl DynamicChemistryRegistry {
         self.processed_generation_masks.push(Vec::new());
         self.group_handles_by_substance.push(Vec::new());
         self.add_group_handles_for_substance(KnownSubstanceIndex::Dynamic(substance_index));
+        self.register_dynamic_acidity_for_substance(substance_index)?;
+        Ok(())
+    }
+
+    fn register_dynamic_acidity_for_substance(
+        &mut self,
+        substance_index: usize,
+    ) -> ChemistryResult<()> {
+        let acid = self
+            .dynamic_substances
+            .get(substance_index)
+            .ok_or_else(|| {
+                ChemistryError::InvalidMixtureState(format!(
+                    "invalid dynamic substance index {substance_index}"
+                ))
+            })?;
+        if acid
+            .tags
+            .iter()
+            .any(|tag| tag == &SubstanceTagId::from("destroy:hypothetical"))
+        {
+            return Ok(());
+        }
+        let Some(structure) = acid.molecular_structure.as_ref() else {
+            return Ok(());
+        };
+        let acid_id = acid.id.clone();
+        let structure = structure.clone();
+        let groups = acid.functional_groups.clone();
+        for (group_index, group) in groups.iter().enumerate() {
+            let Some((base_structure, pka)) =
+                conjugate_base_for_group(&structure, group, &acid_id)?
+            else {
+                continue;
+            };
+            let canonical = write_frowns(&base_structure)?;
+            let base_id = if let Some(existing) = self.canonical_to_id.get(&canonical) {
+                existing.clone()
+            } else {
+                let base = build_dynamic_substance(canonical.clone(), base_structure)?;
+                let base_id = base.id.clone();
+                self.add_dynamic_substance_with_canonical(base, Some(canonical))?;
+                base_id
+            };
+            if self
+                .static_registry
+                .acid_base_specs()
+                .any(|spec| spec.acid == acid_id && spec.conjugate_base == base_id)
+                || self
+                    .dynamic_acid_base_specs
+                    .iter()
+                    .any(|spec| spec.acid == acid_id && spec.conjugate_base == base_id)
+            {
+                continue;
+            }
+            self.dynamic_acid_base_specs.push(AcidBaseSpec::new(
+                format!(
+                    "{}/acid_center_{}",
+                    acid_id.as_str().replace(':', "_"),
+                    group_index
+                ),
+                acid_id.clone(),
+                base_id,
+                pka,
+            ));
+        }
         Ok(())
     }
 
@@ -664,7 +747,18 @@ impl DynamicChemistryRegistry {
 
     fn validate_dynamic_reaction(&self, reaction: &Reaction) -> ChemistryResult<()> {
         reaction.validate_shape()?;
-        for term in reaction.reactants.iter().chain(reaction.products.iter()) {
+        for term in reaction
+            .reactants
+            .iter()
+            .chain(reaction.products.iter())
+            .chain(
+                reaction
+                    .product_distribution
+                    .iter()
+                    .flat_map(|distribution| distribution.variants.iter())
+                    .flat_map(|variant| variant.products.iter()),
+            )
+        {
             self.substance(&term.substance_id)
                 .map_err(|_| ChemistryError::UnknownSubstance {
                     reaction_id: reaction.id.to_string(),
@@ -696,19 +790,14 @@ impl DynamicChemistryRegistry {
             })
             .sum::<ChemistryResult<i32>>()?
             + external_reactant_charge;
-        let product_charge = reaction
-            .products
-            .iter()
-            .map(|term| {
-                self.substance(&term.substance_id)
-                    .map(|substance| substance.charge * term.coefficient as i32)
-            })
-            .sum::<ChemistryResult<i32>>()?;
-        if reactant_charge != product_charge && !reaction.allow_charge_imbalance {
+        let product_charge = self.dynamic_product_charge(reaction)?;
+        if (reactant_charge as f64 - product_charge).abs() > 1.0e-9
+            && !reaction.allow_charge_imbalance
+        {
             return Err(ChemistryError::ChargeNotConserved {
                 reaction_id: reaction.id.to_string(),
                 reactants: reactant_charge,
-                products: product_charge,
+                products: product_charge.round() as i32,
             });
         }
 
@@ -730,14 +819,7 @@ impl DynamicChemistryRegistry {
             })
             .sum::<ChemistryResult<f64>>()?
             + external_reactant_mass;
-        let product_mass = reaction
-            .products
-            .iter()
-            .map(|term| {
-                self.substance(&term.substance_id)
-                    .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
-            })
-            .sum::<ChemistryResult<f64>>()?;
+        let product_mass = self.dynamic_product_mass(reaction)?;
         if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
             && !reaction.allow_mass_imbalance
         {
@@ -748,6 +830,63 @@ impl DynamicChemistryRegistry {
             });
         }
         Ok(())
+    }
+
+    fn dynamic_product_charge(&self, reaction: &Reaction) -> ChemistryResult<f64> {
+        if let Some(distribution) = &reaction.product_distribution {
+            return distribution
+                .variants
+                .iter()
+                .map(|variant| {
+                    let charge = variant
+                        .products
+                        .iter()
+                        .map(|term| {
+                            self.substance(&term.substance_id)
+                                .map(|substance| substance.charge as f64 * term.coefficient as f64)
+                        })
+                        .sum::<ChemistryResult<f64>>()?;
+                    Ok(charge * variant.fraction)
+                })
+                .sum();
+        }
+        reaction
+            .products
+            .iter()
+            .map(|term| {
+                self.substance(&term.substance_id)
+                    .map(|substance| substance.charge as f64 * term.coefficient as f64)
+            })
+            .sum()
+    }
+
+    fn dynamic_product_mass(&self, reaction: &Reaction) -> ChemistryResult<f64> {
+        if let Some(distribution) = &reaction.product_distribution {
+            return distribution
+                .variants
+                .iter()
+                .map(|variant| {
+                    let mass = variant
+                        .products
+                        .iter()
+                        .map(|term| {
+                            self.substance(&term.substance_id).map(|substance| {
+                                substance.molar_mass_grams * term.coefficient as f64
+                            })
+                        })
+                        .sum::<ChemistryResult<f64>>()?;
+                    Ok(mass * variant.fraction)
+                })
+                .sum();
+        }
+        reaction
+            .products
+            .iter()
+            .map(|term| {
+                self.substance(&term.substance_id)
+                    .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
+            })
+            .sum()
     }
 
     fn validated_substance_indices(
@@ -1107,6 +1246,76 @@ fn mark_dynamic_reaction_candidate(
     }
 }
 
+fn conjugate_base_for_group(
+    structure: &MolecularStructure,
+    group: &FunctionalGroup,
+    substance_id: &SubstanceId,
+) -> ChemistryResult<Option<(MolecularStructure, f64)>> {
+    match group.group_type {
+        FunctionalGroupType::CarboxylicAcid => {
+            let oxygen = group_atom(group, 2, substance_id, "carboxylic acid oxygen")?;
+            let proton = group_atom(group, 3, substance_id, "carboxylic acid proton")?;
+            deprotonated_structure(structure, oxygen, proton, -1.0).map(|structure| {
+                Some((
+                    structure,
+                    estimated_acid_pka(FunctionalGroupType::CarboxylicAcid),
+                ))
+            })
+        }
+        FunctionalGroupType::BoricAcid => {
+            let oxygen = group_atom(group, 1, substance_id, "boric acid oxygen")?;
+            let proton = group_atom(group, 2, substance_id, "boric acid proton")?;
+            deprotonated_structure(structure, oxygen, proton, -1.0).map(|structure| {
+                Some((
+                    structure,
+                    estimated_acid_pka(FunctionalGroupType::BoricAcid),
+                ))
+            })
+        }
+        _ => Ok(None),
+    }
+}
+
+fn group_atom(
+    group: &FunctionalGroup,
+    index: usize,
+    substance_id: &SubstanceId,
+    label: &str,
+) -> ChemistryResult<usize> {
+    group
+        .atoms
+        .get(index)
+        .copied()
+        .ok_or_else(|| ChemistryError::InvalidSubstance {
+            substance_id: substance_id.to_string(),
+            reason: format!("acidic functional group is missing {label}"),
+        })
+}
+
+fn deprotonated_structure(
+    structure: &MolecularStructure,
+    charged_atom: usize,
+    proton: usize,
+    charged_atom_charge: f64,
+) -> ChemistryResult<MolecularStructure> {
+    let mut editor = MolecularEditor::new(structure);
+    editor.replace_atom(
+        charged_atom,
+        &structure.atoms[charged_atom].element,
+        charged_atom_charge,
+    )?;
+    editor.remove_atom(proton)?;
+    editor.finish()
+}
+
+fn estimated_acid_pka(group_type: FunctionalGroupType) -> f64 {
+    match group_type {
+        FunctionalGroupType::CarboxylicAcid => 4.8,
+        FunctionalGroupType::BoricAcid => 9.2,
+        _ => unreachable!("only acid functional groups have estimated pKa values"),
+    }
+}
+
 fn build_dynamic_substance(
     canonical_frowns: String,
     structure: MolecularStructure,
@@ -1118,11 +1327,20 @@ fn build_dynamic_substance(
         });
     }
     let summary = structure.summary()?;
-    let tags = if structure.atoms.iter().any(|atom| atom.element == "R") {
-        vec![SubstanceTagId::from("destroy:hypothetical")]
-    } else {
-        Vec::new()
-    };
+    let mut tags = Vec::new();
+    if structure.atoms.iter().any(|atom| atom.element == "R") {
+        tags.push(SubstanceTagId::from("destroy:hypothetical"));
+    }
+    if structure
+        .stereochemistry
+        .iter()
+        .any(|stereo| matches!(stereo, Stereochemistry::Mixture { .. }))
+    {
+        return Err(ChemistryError::InvalidSubstance {
+            substance_id: canonical_frowns,
+            reason: "stereo mixtures are not substances; generators must distribute products into concrete stereoisomers".to_string(),
+        });
+    }
     Ok(Substance::new(
         SubstanceId::new(canonical_frowns.clone())?,
         summary.charge,
@@ -1301,6 +1519,8 @@ fn count_atoms(structure: &MolecularStructure, element: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chemistry::mixture::Mixture;
+    use crate::chemistry::simulation::react_for_tick;
 
     #[test]
     fn generation_tracking_uses_dense_generator_masks() {
@@ -1336,6 +1556,41 @@ mod tests {
         let second = registry.resolve_frowns("CCCCCCCC").unwrap();
         assert_eq!(first, second);
         assert!(first.as_str().starts_with("destroy:linear:"));
+    }
+
+    #[test]
+    fn dynamic_substances_distinguish_stereoisomers() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let clockwise = registry
+            .resolve_frowns(
+                "destroy:graph:atoms=C.H.Cl.F.I;bonds=0-s-1,0-s-2,0-s-3,0-s-4;stereo=t:0:1.2.3.4:cw",
+            )
+            .unwrap();
+        let repeated = registry
+            .resolve_frowns(
+                "destroy:graph:atoms=C.H.Cl.F.I;bonds=0-s-1,0-s-2,0-s-3,0-s-4;stereo=t:0:1.2.3.4:cw",
+            )
+            .unwrap();
+        let counter_clockwise = registry
+            .resolve_frowns(
+                "destroy:graph:atoms=C.H.Cl.F.I;bonds=0-s-1,0-s-2,0-s-3,0-s-4;stereo=t:0:1.2.3.4:ccw",
+            )
+            .unwrap();
+
+        assert_eq!(clockwise, repeated);
+        assert_ne!(clockwise, counter_clockwise);
+    }
+
+    #[test]
+    fn dynamic_stereo_mixture_is_not_a_substance() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let error = registry
+            .resolve_frowns(
+                "destroy:graph:atoms=C.H.Cl.F.I;bonds=0-s-1,0-s-2,0-s-3,0-s-4;stereo=mix:tetra:0.1.2.3.4",
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ChemistryError::InvalidSubstance { .. }));
     }
 
     #[test]
@@ -1447,6 +1702,39 @@ mod tests {
         assert!(properties
             .aqueous_solubility_mol_per_bucket
             .is_some_and(|value| value < 0.1));
+    }
+
+    #[test]
+    fn dynamic_carboxylic_acid_creates_conjugate_base_and_acid_equilibrium() {
+        let mut dynamic = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let acid = dynamic.resolve_frowns("CCC(=O)O").unwrap();
+        let spec = dynamic
+            .dynamic_acid_base_specs
+            .iter()
+            .find(|spec| spec.acid == acid)
+            .expect("dynamic carboxylic acid must register acidity")
+            .clone();
+        let base = dynamic.substance(&spec.conjugate_base).unwrap();
+
+        assert_eq!(base.charge, -1);
+        assert_ne!(spec.conjugate_base, acid);
+        assert!((spec.pka - 4.8).abs() < 1.0e-9);
+
+        let registry = dynamic.to_registry().unwrap();
+        assert!(registry
+            .acid_base_specs()
+            .any(|registered| registered.acid == acid
+                && registered.conjugate_base == spec.conjugate_base));
+
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        mixture.add_substance(&registry, acid.clone(), 0.1).unwrap();
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+
+        assert!(mixture.ph(&registry).unwrap().is_some_and(|ph| ph < 7.0));
+        assert!(mixture.concentration_of(&spec.conjugate_base) > 0.0);
     }
 
     #[test]

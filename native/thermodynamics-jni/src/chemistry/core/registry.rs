@@ -1,8 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::catalysis::{CatalystSurfaceId, CatalystSurfaceSpec};
+use super::complex::ComplexSpec;
 use super::error::{ChemistryError, ChemistryResult};
 use super::mixture::MixturePhase;
-use super::reaction::{Reaction, ReactionId, StoichiometricTerm};
+use super::reaction::{ProductDistribution, Reaction, ReactionId, StoichiometricTerm};
+use super::redox::{
+    validate_half_reaction_conservation, validate_half_reaction_shape, validate_redox_annotation,
+    validate_redox_pair, RedoxHalfReaction, RedoxPair,
+};
+use super::solution::{AcidBaseSpec, EquilibriumSpec, IndexedEquilibrium, IndexedEquilibriumTerm};
 use super::substance::{Substance, SubstanceAggregateState, SubstanceId, SubstanceTagId};
 
 const MASS_TOLERANCE_GRAMS_PER_MOL: f64 = 1.0e-6;
@@ -58,10 +65,17 @@ pub(crate) struct IndexedStoichiometricTerm {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct IndexedProductDistributionVariant {
+    pub fraction: f64,
+    pub products: Vec<IndexedStoichiometricTerm>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct IndexedReaction {
     pub reaction: ReactionIndex,
     pub reactants: Vec<IndexedStoichiometricTerm>,
     pub products: Vec<IndexedStoichiometricTerm>,
+    pub product_distribution: Option<Vec<IndexedProductDistributionVariant>>,
     pub orders: Vec<(SubstanceIndex, u32, Vec<MixturePhase>)>,
 }
 
@@ -109,6 +123,11 @@ pub struct ChemistryRegistry {
     substance_tags: BTreeSet<SubstanceTagId>,
     solvent_miscibility: BTreeMap<(SubstanceIndex, SubstanceIndex), SolventMiscibility>,
     gas_solubility: BTreeMap<SubstanceIndex, GasSolubilityModel>,
+    acid_base_specs: Vec<AcidBaseSpec>,
+    indexed_equilibria: Vec<IndexedEquilibrium>,
+    redox_half_reactions: BTreeMap<String, RedoxHalfReaction>,
+    catalyst_surface_specs: BTreeMap<CatalystSurfaceId, CatalystSurfaceSpec>,
+    complex_specs: Vec<ComplexSpec>,
 }
 
 impl ChemistryRegistry {
@@ -246,6 +265,30 @@ impl ChemistryRegistry {
     pub(crate) fn gas_solubility(&self, substance: SubstanceIndex) -> Option<&GasSolubilityModel> {
         self.gas_solubility.get(&substance)
     }
+
+    pub fn acid_base_specs(&self) -> impl Iterator<Item = &AcidBaseSpec> {
+        self.acid_base_specs.iter()
+    }
+
+    pub(crate) fn indexed_equilibria(&self) -> &[IndexedEquilibrium] {
+        &self.indexed_equilibria
+    }
+
+    pub fn redox_half_reactions(&self) -> impl Iterator<Item = &RedoxHalfReaction> {
+        self.redox_half_reactions.values()
+    }
+
+    pub fn catalyst_surface_spec(&self, id: &CatalystSurfaceId) -> Option<&CatalystSurfaceSpec> {
+        self.catalyst_surface_specs.get(id)
+    }
+
+    pub fn catalyst_surface_specs(&self) -> impl Iterator<Item = &CatalystSurfaceSpec> {
+        self.catalyst_surface_specs.values()
+    }
+
+    pub fn complex_specs(&self) -> impl Iterator<Item = &ComplexSpec> {
+        self.complex_specs.iter()
+    }
 }
 
 #[derive(Default)]
@@ -255,6 +298,12 @@ pub struct ChemistryRegistryBuilder {
     substance_tags: BTreeSet<SubstanceTagId>,
     solvent_miscibility: Vec<(SubstanceId, SubstanceId, SolventMiscibility)>,
     gas_solubility: Vec<(SubstanceId, GasSolubilityModel)>,
+    acid_base_specs: Vec<AcidBaseSpec>,
+    equilibria: Vec<EquilibriumSpec>,
+    redox_half_reactions: Vec<RedoxHalfReaction>,
+    redox_pairs: Vec<RedoxPair>,
+    catalyst_surface_specs: Vec<CatalystSurfaceSpec>,
+    complex_specs: Vec<ComplexSpec>,
 }
 
 impl ChemistryRegistryBuilder {
@@ -263,6 +312,11 @@ impl ChemistryRegistryBuilder {
     }
 
     pub fn from_registry(registry: &ChemistryRegistry) -> Self {
+        let complex_equilibrium_ids = registry
+            .complex_specs
+            .iter()
+            .map(|spec| format!("{}.formation", spec.id))
+            .collect::<BTreeSet<_>>();
         Self {
             substances: registry.substances_by_index.clone(),
             reactions: registry.reactions_by_index.clone(),
@@ -288,6 +342,21 @@ impl ChemistryRegistryBuilder {
                     )
                 })
                 .collect(),
+            acid_base_specs: registry.acid_base_specs.clone(),
+            equilibria: registry
+                .indexed_equilibria
+                .iter()
+                .filter(|equilibrium| {
+                    !equilibrium.spec.id.ends_with(".acid_base_equilibrium")
+                        && !equilibrium.spec.id.ends_with(".neutralization_equilibrium")
+                        && !complex_equilibrium_ids.contains(&equilibrium.spec.id)
+                })
+                .map(|equilibrium| equilibrium.spec.clone())
+                .collect(),
+            redox_half_reactions: registry.redox_half_reactions.values().cloned().collect(),
+            redox_pairs: Vec::new(),
+            catalyst_surface_specs: registry.catalyst_surface_specs.values().cloned().collect(),
+            complex_specs: registry.complex_specs.clone(),
         }
     }
 
@@ -326,9 +395,65 @@ impl ChemistryRegistryBuilder {
         self
     }
 
+    pub fn acid_base_pair(mut self, spec: AcidBaseSpec) -> Self {
+        self.acid_base_specs.push(spec);
+        self
+    }
+
+    pub fn equilibrium(mut self, spec: EquilibriumSpec) -> Self {
+        self.equilibria.push(spec);
+        self
+    }
+
+    pub fn redox_half_reaction(mut self, half_reaction: RedoxHalfReaction) -> Self {
+        self.redox_half_reactions.push(half_reaction);
+        self
+    }
+
+    pub fn redox_pair(mut self, pair: RedoxPair) -> Self {
+        self.redox_pairs.push(pair);
+        self
+    }
+
+    pub fn catalyst_surface_spec(mut self, spec: CatalystSurfaceSpec) -> Self {
+        self.catalyst_surface_specs.push(spec);
+        self
+    }
+
+    pub fn complex_spec(mut self, spec: ComplexSpec) -> Self {
+        self.complex_specs.push(spec);
+        self
+    }
+
     pub fn build(self) -> ChemistryResult<ChemistryRegistry> {
+        let mut redox_half_reactions = BTreeMap::new();
+        for half in self.redox_half_reactions {
+            validate_half_reaction_shape(&half)?;
+            if redox_half_reactions.insert(half.id.clone(), half).is_some() {
+                return Err(ChemistryError::DuplicateReaction(
+                    "<redox-half>".to_string(),
+                ));
+            }
+        }
+        let mut reactions = self.reactions;
+        for pair in self.redox_pairs {
+            validate_redox_pair(&pair, &redox_half_reactions)?;
+            reactions.push(pair.reaction);
+        }
+        let mut substances = self.substances;
+        let mut equilibria = self.equilibria;
+        let complex_specs = build_complex_specs(&self.complex_specs, &substances)?;
+        for (spec, substance) in &complex_specs {
+            if let Some(substance) = substance {
+                substances.push(substance.clone());
+            }
+            equilibria.push(spec.to_equilibrium());
+        }
+
+        let catalyst_surface_specs = build_catalyst_surface_specs(&self.catalyst_surface_specs)?;
+
         let mut substance_map = BTreeMap::new();
-        for substance in self.substances {
+        for substance in substances {
             substance.validate()?;
             let id = substance.id.clone();
             if substance_map.insert(id.clone(), substance).is_some() {
@@ -346,7 +471,7 @@ impl ChemistryRegistryBuilder {
         let substance_properties = build_substance_properties_table(&substances_by_index);
 
         let mut reaction_map = BTreeMap::new();
-        for reaction in self.reactions {
+        for reaction in reactions {
             reaction.validate_shape()?;
             let id = reaction.id.clone();
             if reaction_map.insert(id.clone(), reaction).is_some() {
@@ -376,6 +501,16 @@ impl ChemistryRegistryBuilder {
             &substances_by_index,
             &substance_id_to_index,
         )?;
+        let acid_base_specs = validate_acid_base_specs(
+            &self.acid_base_specs,
+            &substances_by_index,
+            &substance_id_to_index,
+        )?;
+        for spec in &acid_base_specs {
+            equilibria.extend(spec.to_equilibria());
+        }
+        let indexed_equilibria =
+            build_indexed_equilibria(&equilibria, &substances_by_index, &substance_id_to_index)?;
         let registry = ChemistryRegistry {
             substances_by_index,
             substance_id_to_index,
@@ -388,7 +523,13 @@ impl ChemistryRegistryBuilder {
             substance_tags: self.substance_tags,
             solvent_miscibility,
             gas_solubility,
+            acid_base_specs,
+            indexed_equilibria,
+            redox_half_reactions,
+            catalyst_surface_specs,
+            complex_specs: complex_specs.into_iter().map(|(spec, _)| spec).collect(),
         };
+        registry.validate_redox_half_reactions()?;
         registry.validate_substance_tags()?;
         registry.validate_reactions()?;
         Ok(registry)
@@ -411,8 +552,34 @@ impl ChemistryRegistry {
     }
 
     fn validate_reactions(&self) -> ChemistryResult<()> {
+        let known_reaction_ids = self
+            .reaction_id_to_index
+            .iter()
+            .map(|(id, index)| (id.clone(), index.0))
+            .collect::<BTreeMap<_, _>>();
         for reaction in &self.reactions_by_index {
-            for term in reaction.reactants.iter().chain(reaction.products.iter()) {
+            validate_redox_annotation(reaction, &known_reaction_ids, &self.redox_half_reactions)?;
+            if let Some(redox) = &reaction.redox {
+                for participant in [redox.oxidant.as_ref(), redox.reductant.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !participant.as_str().starts_with("external:")
+                        && !self.substance_id_to_index.contains_key(participant)
+                    {
+                        return Err(ChemistryError::UnknownSubstance {
+                            reaction_id: reaction.id.to_string(),
+                            substance_id: participant.to_string(),
+                        });
+                    }
+                }
+            }
+            for term in reaction
+                .reactants
+                .iter()
+                .chain(reaction.products.iter())
+                .chain(distributed_product_terms(reaction))
+            {
                 if !self.substance_id_to_index.contains_key(&term.substance_id) {
                     return Err(ChemistryError::UnknownSubstance {
                         reaction_id: reaction.id.to_string(),
@@ -440,10 +607,41 @@ impl ChemistryRegistry {
                     });
                 }
             }
+            for requirement in &reaction.surface_requirements {
+                let Some(surface_spec) = self.catalyst_surface_specs.get(&requirement.surface_id)
+                else {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction.id.to_string(),
+                        reason: format!("unknown catalyst surface '{}'", requirement.surface_id),
+                    });
+                };
+                if !requirement
+                    .phases
+                    .iter()
+                    .any(|phase| surface_spec.accessible_phases.contains(phase))
+                {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction.id.to_string(),
+                        reason: format!(
+                            "surface '{}' is not accessible from any required phase",
+                            requirement.surface_id
+                        ),
+                    });
+                }
+            }
+            for step in &reaction.surface_steps {
+                if !self.catalyst_surface_specs.contains_key(step.surface_id()) {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction.id.to_string(),
+                        reason: format!("unknown catalyst surface '{}'", step.surface_id()),
+                    });
+                }
+            }
 
             for requirement in reaction
                 .external_reactants
                 .iter()
+                .chain(reaction.external_products.iter())
                 .chain(reaction.external_catalysts.iter())
             {
                 if requirement.description.trim().is_empty() {
@@ -487,25 +685,23 @@ impl ChemistryRegistry {
                 })
                 .sum::<ChemistryResult<i32>>()?
                 + external_reactant_charge;
-            let product_charge = reaction
-                .products
+            let external_product_charge = reaction
+                .external_products
                 .iter()
-                .map(|term| {
-                    self.substance_index(&term.substance_id)
-                        .map(|index| {
-                            self.substance_properties.charge[index.0] * term.coefficient as i32
-                        })
-                        .ok_or_else(|| ChemistryError::UnknownSubstance {
-                            reaction_id: reaction.id.to_string(),
-                            substance_id: term.substance_id.to_string(),
-                        })
+                .filter_map(|requirement| {
+                    requirement
+                        .charge
+                        .map(|charge| charge * requirement.moles_per_reaction.round() as i32)
                 })
-                .sum::<ChemistryResult<i32>>()?;
-            if reactant_charge != product_charge && !reaction.allow_charge_imbalance {
+                .sum::<i32>();
+            let product_charge = product_charge(reaction, self)? + external_product_charge as f64;
+            if (reactant_charge as f64 - product_charge).abs() > 1.0e-9
+                && !reaction.allow_charge_imbalance
+            {
                 return Err(ChemistryError::ChargeNotConserved {
                     reaction_id: reaction.id.to_string(),
                     reactants: reactant_charge,
-                    products: product_charge,
+                    products: product_charge.round() as i32,
                 });
             }
 
@@ -527,14 +723,16 @@ impl ChemistryRegistry {
                 })
                 .sum::<ChemistryResult<f64>>()?
                 + external_reactant_mass;
-            let product_mass = reaction
-                .products
+            let external_product_mass = reaction
+                .external_products
                 .iter()
-                .map(|term| {
-                    self.substance(&term.substance_id)
-                        .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
+                .filter_map(|requirement| {
+                    requirement
+                        .molar_mass_grams
+                        .map(|mass| mass * requirement.moles_per_reaction)
                 })
-                .sum::<ChemistryResult<f64>>()?;
+                .sum::<f64>();
+            let product_mass = product_mass(reaction, self)? + external_product_mass;
             if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
                 && !reaction.allow_mass_imbalance
             {
@@ -597,6 +795,16 @@ impl ChemistryRegistry {
         }
         Ok(())
     }
+
+    fn validate_redox_half_reactions(&self) -> ChemistryResult<()> {
+        for half in self.redox_half_reactions.values() {
+            validate_half_reaction_conservation(half, |substance_id| {
+                let substance = self.substance(substance_id)?;
+                Ok((substance.molar_mass_grams, substance.charge))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn stoichiometric_map(terms: &[StoichiometricTerm]) -> BTreeMap<SubstanceId, u32> {
@@ -605,6 +813,87 @@ fn stoichiometric_map(terms: &[StoichiometricTerm]) -> BTreeMap<SubstanceId, u32
         *result.entry(term.substance_id.clone()).or_insert(0) += term.coefficient;
     }
     result
+}
+
+fn distributed_product_terms(reaction: &Reaction) -> impl Iterator<Item = &StoichiometricTerm> {
+    reaction
+        .product_distribution
+        .iter()
+        .flat_map(|distribution| distribution.variants.iter())
+        .flat_map(|variant| variant.products.iter())
+}
+
+fn product_charge(reaction: &Reaction, registry: &ChemistryRegistry) -> ChemistryResult<f64> {
+    if let Some(distribution) = &reaction.product_distribution {
+        return distribution
+            .variants
+            .iter()
+            .map(|variant| {
+                let charge = variant
+                    .products
+                    .iter()
+                    .map(|term| {
+                        registry
+                            .substance_index(&term.substance_id)
+                            .map(|index| {
+                                registry.substance_properties.charge[index.0] as f64
+                                    * term.coefficient as f64
+                            })
+                            .ok_or_else(|| ChemistryError::UnknownSubstance {
+                                reaction_id: reaction.id.to_string(),
+                                substance_id: term.substance_id.to_string(),
+                            })
+                    })
+                    .sum::<ChemistryResult<f64>>()?;
+                Ok(charge * variant.fraction)
+            })
+            .sum();
+    }
+    reaction
+        .products
+        .iter()
+        .map(|term| {
+            registry
+                .substance_index(&term.substance_id)
+                .map(|index| {
+                    registry.substance_properties.charge[index.0] as f64 * term.coefficient as f64
+                })
+                .ok_or_else(|| ChemistryError::UnknownSubstance {
+                    reaction_id: reaction.id.to_string(),
+                    substance_id: term.substance_id.to_string(),
+                })
+        })
+        .sum()
+}
+
+fn product_mass(reaction: &Reaction, registry: &ChemistryRegistry) -> ChemistryResult<f64> {
+    if let Some(distribution) = &reaction.product_distribution {
+        return distribution
+            .variants
+            .iter()
+            .map(|variant| {
+                let mass = variant
+                    .products
+                    .iter()
+                    .map(|term| {
+                        registry
+                            .substance(&term.substance_id)
+                            .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
+                    })
+                    .sum::<ChemistryResult<f64>>()?;
+                Ok(mass * variant.fraction)
+            })
+            .sum();
+    }
+    reaction
+        .products
+        .iter()
+        .map(|term| {
+            registry
+                .substance(&term.substance_id)
+                .map(|substance| substance.molar_mass_grams * term.coefficient as f64)
+        })
+        .sum()
 }
 
 fn build_substance_properties_table(substances: &[Substance]) -> SubstancePropertiesTable {
@@ -646,6 +935,80 @@ fn build_substance_properties_table(substances: &[Substance]) -> SubstanceProper
             .map(|substance| substance.latent_heat_j_per_mol)
             .collect(),
     }
+}
+
+fn build_complex_specs(
+    specs: &[ComplexSpec],
+    base_substances: &[Substance],
+) -> ChemistryResult<Vec<(ComplexSpec, Option<Substance>)>> {
+    let mut substances_by_id = base_substances
+        .iter()
+        .map(|substance| (substance.id.clone(), substance.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for spec in specs {
+        spec.validate_shape()?;
+        if !seen.insert(spec.id.clone()) {
+            return Err(ChemistryError::DuplicateSubstance(spec.id.to_string()));
+        }
+        let central = substances_by_id.get(&spec.central_ion).ok_or_else(|| {
+            ChemistryError::UnknownSubstance {
+                reaction_id: format!("{}.formation", spec.id),
+                substance_id: spec.central_ion.to_string(),
+            }
+        })?;
+        let mut charge = central.charge;
+        let mut mass = central.molar_mass_grams;
+        for ligand in &spec.ligands {
+            let ligand_substance = substances_by_id.get(&ligand.substance_id).ok_or_else(|| {
+                ChemistryError::UnknownSubstance {
+                    reaction_id: format!("{}.formation", spec.id),
+                    substance_id: ligand.substance_id.to_string(),
+                }
+            })?;
+            charge += ligand_substance.charge * ligand.count as i32;
+            mass += ligand_substance.molar_mass_grams * ligand.count as f64;
+        }
+        if let Some(existing) = substances_by_id.get(&spec.id) {
+            if existing.charge != spec.charge {
+                return Err(ChemistryError::ChargeNotConserved {
+                    reaction_id: format!("{}.formation", spec.id),
+                    reactants: charge,
+                    products: existing.charge,
+                });
+            }
+            if (existing.molar_mass_grams - mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL {
+                return Err(ChemistryError::MassNotConserved {
+                    reaction_id: format!("{}.formation", spec.id),
+                    reactants: mass,
+                    products: existing.molar_mass_grams,
+                });
+            }
+            result.push((spec.clone(), None));
+        } else {
+            let substance = spec.to_substance(mass, charge)?;
+            substances_by_id.insert(spec.id.clone(), substance.clone());
+            result.push((spec.clone(), Some(substance)));
+        }
+    }
+    Ok(result)
+}
+
+fn build_catalyst_surface_specs(
+    specs: &[CatalystSurfaceSpec],
+) -> ChemistryResult<BTreeMap<CatalystSurfaceId, CatalystSurfaceSpec>> {
+    let mut result = BTreeMap::new();
+    for spec in specs {
+        spec.validate()?;
+        if result.insert(spec.id.clone(), spec.clone()).is_some() {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.to_string(),
+                reason: "duplicate catalyst surface spec".to_string(),
+            });
+        }
+    }
+    Ok(result)
 }
 
 fn build_solvent_miscibility(
@@ -741,6 +1104,202 @@ fn build_gas_solubility(
     Ok(result)
 }
 
+fn validate_acid_base_specs(
+    specs: &[AcidBaseSpec],
+    substances: &[Substance],
+    substance_id_to_index: &BTreeMap<SubstanceId, SubstanceIndex>,
+) -> ChemistryResult<Vec<AcidBaseSpec>> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for spec in specs {
+        if spec.id.trim().is_empty() {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: "<acid-base>".to_string(),
+                reason: "acid-base spec id must not be empty".to_string(),
+            });
+        }
+        if !spec.pka.is_finite() {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "pKa must be finite".to_string(),
+            });
+        }
+        if !seen.insert(spec.id.clone()) {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "duplicate acid-base spec".to_string(),
+            });
+        }
+        let acid = *substance_id_to_index.get(&spec.acid).ok_or_else(|| {
+            ChemistryError::UnknownSubstance {
+                reaction_id: spec.id.clone(),
+                substance_id: spec.acid.to_string(),
+            }
+        })?;
+        let base = *substance_id_to_index
+            .get(&spec.conjugate_base)
+            .ok_or_else(|| ChemistryError::UnknownSubstance {
+                reaction_id: spec.id.clone(),
+                substance_id: spec.conjugate_base.to_string(),
+            })?;
+        let proton = *substance_id_to_index.get(&spec.proton).ok_or_else(|| {
+            ChemistryError::UnknownSubstance {
+                reaction_id: spec.id.clone(),
+                substance_id: spec.proton.to_string(),
+            }
+        })?;
+        let acid_charge = substances[acid.0].charge;
+        let base_charge = substances[base.0].charge;
+        let proton_charge = substances[proton.0].charge;
+        if acid_charge != base_charge + proton_charge {
+            return Err(ChemistryError::ChargeNotConserved {
+                reaction_id: spec.id.clone(),
+                reactants: acid_charge,
+                products: base_charge + proton_charge,
+            });
+        }
+        result.push(spec.clone());
+    }
+    Ok(result)
+}
+
+fn build_indexed_equilibria(
+    specs: &[EquilibriumSpec],
+    substances: &[Substance],
+    substance_id_to_index: &BTreeMap<SubstanceId, SubstanceIndex>,
+) -> ChemistryResult<Vec<IndexedEquilibrium>> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for spec in specs {
+        validate_equilibrium_spec_shape(spec)?;
+        if !seen.insert(spec.id.clone()) {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "duplicate equilibrium spec".to_string(),
+            });
+        }
+        let reactants = index_equilibrium_terms(&spec.id, &spec.reactants, substance_id_to_index)?;
+        let products = index_equilibrium_terms(&spec.id, &spec.products, substance_id_to_index)?;
+        validate_equilibrium_conservation(spec, substances, &reactants, &products)?;
+        result.push(IndexedEquilibrium {
+            spec: spec.clone(),
+            reactants,
+            products,
+        });
+    }
+    Ok(result)
+}
+
+fn validate_equilibrium_spec_shape(spec: &EquilibriumSpec) -> ChemistryResult<()> {
+    if spec.id.trim().is_empty() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: "<equilibrium>".to_string(),
+            reason: "equilibrium id must not be empty".to_string(),
+        });
+    }
+    if spec.reactants.is_empty() || spec.products.is_empty() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "equilibrium must have reactants and products".to_string(),
+        });
+    }
+    if !spec.equilibrium_constant.is_finite() || spec.equilibrium_constant <= 0.0 {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "equilibrium constant must be positive and finite".to_string(),
+        });
+    }
+    if !spec.reference_temperature_kelvin.is_finite() || spec.reference_temperature_kelvin <= 0.0 {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "equilibrium reference temperature must be positive and finite".to_string(),
+        });
+    }
+    if !spec.enthalpy_change_kj_per_mol.is_finite() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "equilibrium enthalpy change must be finite".to_string(),
+        });
+    }
+    for term in spec.reactants.iter().chain(spec.products.iter()) {
+        if term.coefficient == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "equilibrium coefficients must be greater than zero".to_string(),
+            });
+        }
+        if term.phase == MixturePhase::Gas || term.phase == MixturePhase::Solid {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "solution equilibria may only use liquid phases".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn index_equilibrium_terms(
+    equilibrium_id: &str,
+    terms: &[super::solution::EquilibriumTerm],
+    substance_id_to_index: &BTreeMap<SubstanceId, SubstanceIndex>,
+) -> ChemistryResult<Vec<IndexedEquilibriumTerm>> {
+    terms
+        .iter()
+        .map(|term| {
+            let substance = *substance_id_to_index
+                .get(&term.substance_id)
+                .ok_or_else(|| ChemistryError::UnknownSubstance {
+                    reaction_id: equilibrium_id.to_string(),
+                    substance_id: term.substance_id.to_string(),
+                })?;
+            Ok(IndexedEquilibriumTerm {
+                substance,
+                coefficient: term.coefficient,
+                phase: term.phase,
+            })
+        })
+        .collect()
+}
+
+fn validate_equilibrium_conservation(
+    spec: &EquilibriumSpec,
+    substances: &[Substance],
+    reactants: &[IndexedEquilibriumTerm],
+    products: &[IndexedEquilibriumTerm],
+) -> ChemistryResult<()> {
+    let reactant_charge = reactants
+        .iter()
+        .map(|term| substances[term.substance.0].charge * term.coefficient as i32)
+        .sum::<i32>();
+    let product_charge = products
+        .iter()
+        .map(|term| substances[term.substance.0].charge * term.coefficient as i32)
+        .sum::<i32>();
+    if reactant_charge != product_charge {
+        return Err(ChemistryError::ChargeNotConserved {
+            reaction_id: spec.id.clone(),
+            reactants: reactant_charge,
+            products: product_charge,
+        });
+    }
+    let reactant_mass = reactants
+        .iter()
+        .map(|term| substances[term.substance.0].molar_mass_grams * term.coefficient as f64)
+        .sum::<f64>();
+    let product_mass = products
+        .iter()
+        .map(|term| substances[term.substance.0].molar_mass_grams * term.coefficient as f64)
+        .sum::<f64>();
+    if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL {
+        return Err(ChemistryError::MassNotConserved {
+            reaction_id: spec.id.clone(),
+            reactants: reactant_mass,
+            products: product_mass,
+        });
+    }
+    Ok(())
+}
+
 fn validate_gas_solubility_model(
     substance_id: &SubstanceId,
     model: &GasSolubilityModel,
@@ -801,6 +1360,13 @@ fn build_indexed_reactions(
                 .iter()
                 .map(|term| indexed_product_term(reaction, term, substance_id_to_index))
                 .collect::<ChemistryResult<Vec<_>>>()?;
+            let product_distribution = reaction
+                .product_distribution
+                .as_ref()
+                .map(|distribution| {
+                    indexed_product_distribution(reaction, distribution, substance_id_to_index)
+                })
+                .transpose()?;
             let orders = reaction
                 .orders
                 .iter()
@@ -828,7 +1394,29 @@ fn build_indexed_reactions(
                 reaction: reaction_index,
                 reactants,
                 products,
+                product_distribution,
                 orders,
+            })
+        })
+        .collect()
+}
+
+fn indexed_product_distribution(
+    reaction: &Reaction,
+    distribution: &ProductDistribution,
+    substance_id_to_index: &BTreeMap<SubstanceId, SubstanceIndex>,
+) -> ChemistryResult<Vec<IndexedProductDistributionVariant>> {
+    distribution
+        .variants
+        .iter()
+        .map(|variant| {
+            Ok(IndexedProductDistributionVariant {
+                fraction: variant.fraction,
+                products: variant
+                    .products
+                    .iter()
+                    .map(|term| indexed_product_term(reaction, term, substance_id_to_index))
+                    .collect::<ChemistryResult<Vec<_>>>()?,
             })
         })
         .collect()

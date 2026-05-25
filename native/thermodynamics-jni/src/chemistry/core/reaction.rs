@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+use super::catalysis::{CatalystSurfaceId, SurfaceRequirement, SurfaceSiteId, SurfaceStep};
 use super::error::{ChemistryError, ChemistryResult};
 use super::mixture::MixturePhase;
+use super::redox::{RedoxAnnotation, ELECTRON_EXTERNAL_ID};
 use super::substance::SubstanceId;
 
 pub const GAS_CONSTANT_J_PER_MOL_KELVIN: f64 = 8.314_462_618_153_24;
@@ -61,12 +63,25 @@ impl StoichiometricTerm {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProductDistributionVariant {
+    pub fraction: f64,
+    pub products: Vec<StoichiometricTerm>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductDistribution {
+    pub variants: Vec<ProductDistributionVariant>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Reaction {
     pub id: ReactionId,
     pub reactants: Vec<StoichiometricTerm>,
     pub products: Vec<StoichiometricTerm>,
+    pub product_distribution: Option<ProductDistribution>,
     pub orders: BTreeMap<SubstanceId, u32>,
     pub external_reactants: Vec<ExternalRequirement>,
+    pub external_products: Vec<ExternalRequirement>,
     pub external_catalysts: Vec<ExternalRequirement>,
     pub reaction_results: Vec<ReactionResult>,
     pub pre_exponential_factor: f64,
@@ -79,8 +94,11 @@ pub struct Reaction {
     pub show_in_jei_condition: Option<String>,
     pub allow_mass_imbalance: bool,
     pub allow_charge_imbalance: bool,
+    pub redox: Option<RedoxAnnotation>,
     pub phase_access: BTreeMap<SubstanceId, ReactionPhaseAccess>,
     pub product_phases: BTreeMap<SubstanceId, MixturePhase>,
+    pub surface_requirements: Vec<SurfaceRequirement>,
+    pub surface_steps: Vec<SurfaceStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,8 +158,10 @@ impl Reaction {
                 id: id.into(),
                 reactants: Vec::new(),
                 products: Vec::new(),
+                product_distribution: None,
                 orders: BTreeMap::new(),
                 external_reactants: Vec::new(),
+                external_products: Vec::new(),
                 external_catalysts: Vec::new(),
                 reaction_results: Vec::new(),
                 pre_exponential_factor: 10_000.0,
@@ -154,8 +174,11 @@ impl Reaction {
                 show_in_jei_condition: None,
                 allow_mass_imbalance: false,
                 allow_charge_imbalance: false,
+                redox: None,
                 phase_access: BTreeMap::new(),
                 product_phases: BTreeMap::new(),
+                surface_requirements: Vec::new(),
+                surface_steps: Vec::new(),
             },
         }
     }
@@ -176,14 +199,18 @@ impl Reaction {
     pub fn has_external_context(&self) -> bool {
         self.requires_uv
             || !self.external_reactants.is_empty()
+            || !self.external_products.is_empty()
             || !self.external_catalysts.is_empty()
             || !self.reaction_results.is_empty()
+            || !self.surface_requirements.is_empty()
+            || !self.surface_steps.is_empty()
     }
 
     pub fn requires_context_to_proceed(&self) -> bool {
         self.requires_uv
             || !self.external_reactants.is_empty()
             || !self.external_catalysts.is_empty()
+            || !self.surface_requirements.is_empty()
     }
 
     pub fn validate_shape(&self) -> ChemistryResult<()> {
@@ -195,18 +222,69 @@ impl Reaction {
                     reason: "reaction must have at least one reactant".to_string(),
                 });
             }
-            if self.products.is_empty() {
+            if self.products.is_empty() && self.product_distribution.is_none() {
                 return Err(ChemistryError::InvalidReaction {
                     reaction_id: reaction_id.clone(),
                     reason: "reaction must have at least one product".to_string(),
                 });
             }
         }
-        for term in self.reactants.iter().chain(self.products.iter()) {
+        for term in self.reactants.iter().chain(self.products.iter()).chain(
+            self.product_distribution
+                .iter()
+                .flat_map(|distribution| distribution.variants.iter())
+                .flat_map(|variant| variant.products.iter()),
+        ) {
             if term.coefficient == 0 {
                 return Err(ChemistryError::InvalidReaction {
                     reaction_id: reaction_id.clone(),
                     reason: "stoichiometric coefficients must be greater than zero".to_string(),
+                });
+            }
+        }
+        if let Some(distribution) = &self.product_distribution {
+            if !self.products.is_empty() {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "distributed reactions must not also have direct products".to_string(),
+                });
+            }
+            if distribution.variants.is_empty() {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "product distribution must contain at least one variant".to_string(),
+                });
+            }
+            let mut total_fraction = 0.0;
+            for variant in &distribution.variants {
+                if !variant.fraction.is_finite() || variant.fraction <= 0.0 {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction_id.clone(),
+                        reason: "product distribution fractions must be positive and finite"
+                            .to_string(),
+                    });
+                }
+                if variant.products.is_empty() {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction_id.clone(),
+                        reason: "product distribution variants must contain products".to_string(),
+                    });
+                }
+                total_fraction += variant.fraction;
+            }
+            if (total_fraction - 1.0).abs() > 1.0e-9 {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: format!(
+                        "product distribution fractions must sum to 1.0, got {total_fraction}"
+                    ),
+                });
+            }
+            if self.reverse_reaction_id.is_some() {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "distributed products cannot be mirrored by a single reverse reaction"
+                        .to_string(),
                 });
             }
         }
@@ -227,6 +305,7 @@ impl Reaction {
         for requirement in self
             .external_reactants
             .iter()
+            .chain(self.external_products.iter())
             .chain(self.external_catalysts.iter())
         {
             if !requirement.moles_per_reaction.is_finite() || requirement.moles_per_reaction <= 0.0
@@ -274,6 +353,12 @@ impl Reaction {
                 });
             }
         }
+        for requirement in &self.surface_requirements {
+            requirement.validate(&reaction_id)?;
+        }
+        for step in &self.surface_steps {
+            step.validate(&reaction_id)?;
+        }
         if !self.pre_exponential_factor.is_finite() || self.pre_exponential_factor <= 0.0 {
             return Err(ChemistryError::InvalidReaction {
                 reaction_id: reaction_id.clone(),
@@ -292,6 +377,26 @@ impl Reaction {
                 reaction_id: reaction_id.clone(),
                 reason: "enthalpy change must be finite".to_string(),
             });
+        }
+        if let Some(redox) = &self.redox {
+            if redox.transferred_electrons == 0 {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "redox annotation must transfer at least one electron".to_string(),
+                });
+            }
+            if self.allow_charge_imbalance {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "redox reactions may not allow charge imbalance".to_string(),
+                });
+            }
+            if !redox.electron_balance_checked {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "redox annotation must be explicitly electron-balanced".to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -323,6 +428,30 @@ impl ReactionBuilder {
         self
     }
 
+    pub fn product_distribution_variant<I, S>(mut self, fraction: f64, products: I) -> Self
+    where
+        I: IntoIterator<Item = (S, u32)>,
+        S: Into<SubstanceId>,
+    {
+        let variant = ProductDistributionVariant {
+            fraction,
+            products: products
+                .into_iter()
+                .map(|(substance_id, coefficient)| {
+                    StoichiometricTerm::new(substance_id, coefficient)
+                })
+                .collect(),
+        };
+        self.reaction
+            .product_distribution
+            .get_or_insert_with(|| ProductDistribution {
+                variants: Vec::new(),
+            })
+            .variants
+            .push(variant);
+        self
+    }
+
     pub fn catalyst_order(mut self, substance_id: impl Into<SubstanceId>, order: u32) -> Self {
         self.reaction.orders.insert(substance_id.into(), order);
         self
@@ -348,11 +477,14 @@ impl ReactionBuilder {
             unchecked_mass_reason: Some(format!(
                 "legacy external catalyst '{description}' has no chemical formula in the model"
             )),
-            description,
+            description: description.clone(),
             moles_per_reaction: moles,
             molar_mass_grams: None,
             charge: None,
         });
+        self.reaction
+            .surface_requirements
+            .push(SurfaceRequirement::new(description.clone(), moles));
         self
     }
 
@@ -373,6 +505,31 @@ impl ReactionBuilder {
         self
     }
 
+    pub fn chemical_external_product(
+        mut self,
+        description: impl Into<String>,
+        moles: f64,
+        molar_mass_grams: f64,
+        charge: i32,
+    ) -> Self {
+        self.reaction.external_products.push(ExternalRequirement {
+            description: description.into(),
+            moles_per_reaction: moles,
+            molar_mass_grams: Some(molar_mass_grams),
+            charge: Some(charge),
+            unchecked_mass_reason: None,
+        });
+        self
+    }
+
+    pub fn electron_reactant(self, count: u32) -> Self {
+        self.chemical_external_reactant(ELECTRON_EXTERNAL_ID, count as f64, 0.0, -1)
+    }
+
+    pub fn electron_product(self, count: u32) -> Self {
+        self.chemical_external_product(ELECTRON_EXTERNAL_ID, count as f64, 0.0, -1)
+    }
+
     pub fn chemical_external_catalyst(
         mut self,
         description: impl Into<String>,
@@ -380,13 +537,17 @@ impl ReactionBuilder {
         molar_mass_grams: f64,
         charge: i32,
     ) -> Self {
+        let description = description.into();
         self.reaction.external_catalysts.push(ExternalRequirement {
-            description: description.into(),
+            description: description.clone(),
             moles_per_reaction: moles,
             molar_mass_grams: Some(molar_mass_grams),
             charge: Some(charge),
             unchecked_mass_reason: None,
         });
+        self.reaction
+            .surface_requirements
+            .push(SurfaceRequirement::new(description, moles));
         self
     }
 
@@ -448,6 +609,11 @@ impl ReactionBuilder {
         self
     }
 
+    pub fn redox_annotation(mut self, annotation: RedoxAnnotation) -> Self {
+        self.reaction.redox = Some(annotation);
+        self
+    }
+
     pub fn reactant_phase_access(
         mut self,
         substance_id: impl Into<SubstanceId>,
@@ -470,6 +636,83 @@ impl ReactionBuilder {
         self.reaction
             .product_phases
             .insert(substance_id.into(), phase);
+        self
+    }
+
+    pub fn surface_requirement(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        sites_per_reaction: f64,
+    ) -> Self {
+        self.reaction
+            .surface_requirements
+            .push(SurfaceRequirement::new(surface_id, sites_per_reaction));
+        self
+    }
+
+    pub fn surface_requirement_with_phases(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        sites_per_reaction: f64,
+        phases: impl IntoIterator<Item = MixturePhase>,
+    ) -> Self {
+        self.reaction
+            .surface_requirements
+            .push(SurfaceRequirement::new(surface_id, sites_per_reaction).with_phases(phases));
+        self
+    }
+
+    pub fn surface_adsorption(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        site_id: impl Into<SurfaceSiteId>,
+        sites_per_reaction: f64,
+    ) -> Self {
+        self.reaction.surface_steps.push(SurfaceStep::Adsorb {
+            surface_id: surface_id.into(),
+            site_id: site_id.into(),
+            sites_per_reaction,
+        });
+        self
+    }
+
+    pub fn surface_desorption(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        site_id: impl Into<SurfaceSiteId>,
+        sites_per_reaction: f64,
+    ) -> Self {
+        self.reaction.surface_steps.push(SurfaceStep::Desorb {
+            surface_id: surface_id.into(),
+            site_id: site_id.into(),
+            sites_per_reaction,
+        });
+        self
+    }
+
+    pub fn surface_poisoning(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        site_id: impl Into<SurfaceSiteId>,
+        sites_per_reaction: f64,
+    ) -> Self {
+        self.reaction.surface_steps.push(SurfaceStep::Poison {
+            surface_id: surface_id.into(),
+            site_id: site_id.into(),
+            sites_per_reaction,
+        });
+        self
+    }
+
+    pub fn surface_recovery(
+        mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        sites_per_reaction: f64,
+    ) -> Self {
+        self.reaction.surface_steps.push(SurfaceStep::Restore {
+            surface_id: surface_id.into(),
+            sites_per_reaction,
+        });
         self
     }
 
