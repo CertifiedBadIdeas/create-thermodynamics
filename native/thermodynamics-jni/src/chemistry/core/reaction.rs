@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use super::catalysis::{CatalystSurfaceId, SurfaceRequirement, SurfaceSiteId, SurfaceStep};
+use super::condition::ReactionCondition;
 use super::error::{ChemistryError, ChemistryResult};
+use super::kinetics::ReactionChannel;
 use super::mixture::MixturePhase;
 use super::redox::{RedoxAnnotation, ELECTRON_EXTERNAL_ID};
 use super::substance::SubstanceId;
@@ -79,6 +81,7 @@ pub struct Reaction {
     pub reactants: Vec<StoichiometricTerm>,
     pub products: Vec<StoichiometricTerm>,
     pub product_distribution: Option<ProductDistribution>,
+    pub channels: Vec<ReactionChannel>,
     pub orders: BTreeMap<SubstanceId, u32>,
     pub external_reactants: Vec<ExternalRequirement>,
     pub external_products: Vec<ExternalRequirement>,
@@ -99,6 +102,7 @@ pub struct Reaction {
     pub product_phases: BTreeMap<SubstanceId, MixturePhase>,
     pub surface_requirements: Vec<SurfaceRequirement>,
     pub surface_steps: Vec<SurfaceStep>,
+    pub conditions: Vec<ReactionCondition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +163,7 @@ impl Reaction {
                 reactants: Vec::new(),
                 products: Vec::new(),
                 product_distribution: None,
+                channels: Vec::new(),
                 orders: BTreeMap::new(),
                 external_reactants: Vec::new(),
                 external_products: Vec::new(),
@@ -179,6 +184,7 @@ impl Reaction {
                 product_phases: BTreeMap::new(),
                 surface_requirements: Vec::new(),
                 surface_steps: Vec::new(),
+                conditions: Vec::new(),
             },
         }
     }
@@ -223,18 +229,55 @@ impl Reaction {
                 });
             }
             if self.products.is_empty() && self.product_distribution.is_none() {
-                return Err(ChemistryError::InvalidReaction {
-                    reaction_id: reaction_id.clone(),
-                    reason: "reaction must have at least one product".to_string(),
-                });
+                if self.channels.is_empty() {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction_id.clone(),
+                        reason: "reaction must have at least one product".to_string(),
+                    });
+                }
             }
         }
-        for term in self.reactants.iter().chain(self.products.iter()).chain(
-            self.product_distribution
-                .iter()
-                .flat_map(|distribution| distribution.variants.iter())
-                .flat_map(|variant| variant.products.iter()),
-        ) {
+        if !self.channels.is_empty() {
+            if !self.products.is_empty() || self.product_distribution.is_some() {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "channel reactions must get products from channels only".to_string(),
+                });
+            }
+            if self.reverse_reaction_id.is_some() {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: reaction_id.clone(),
+                    reason: "channel reactions cannot be mirrored by a single reverse reaction"
+                        .to_string(),
+                });
+            }
+            let mut channel_ids = std::collections::BTreeSet::new();
+            for channel in &self.channels {
+                channel.validate(&self.id)?;
+                if !channel_ids.insert(channel.id.clone()) {
+                    return Err(ChemistryError::InvalidReaction {
+                        reaction_id: reaction_id.clone(),
+                        reason: format!("duplicate reaction channel '{}'", channel.id),
+                    });
+                }
+            }
+        }
+        for term in self
+            .reactants
+            .iter()
+            .chain(self.products.iter())
+            .chain(
+                self.product_distribution
+                    .iter()
+                    .flat_map(|distribution| distribution.variants.iter())
+                    .flat_map(|variant| variant.products.iter()),
+            )
+            .chain(
+                self.channels
+                    .iter()
+                    .flat_map(|channel| channel.products.iter()),
+            )
+        {
             if term.coefficient == 0 {
                 return Err(ChemistryError::InvalidReaction {
                     reaction_id: reaction_id.clone(),
@@ -359,6 +402,9 @@ impl Reaction {
         for step in &self.surface_steps {
             step.validate(&reaction_id)?;
         }
+        for condition in &self.conditions {
+            condition.validate(&reaction_id)?;
+        }
         if !self.pre_exponential_factor.is_finite() || self.pre_exponential_factor <= 0.0 {
             return Err(ChemistryError::InvalidReaction {
                 reaction_id: reaction_id.clone(),
@@ -449,6 +495,16 @@ impl ReactionBuilder {
             })
             .variants
             .push(variant);
+        self
+    }
+
+    pub fn channel(mut self, channel: ReactionChannel) -> Self {
+        self.reaction.channels.push(channel);
+        self
+    }
+
+    pub fn condition(mut self, condition: ReactionCondition) -> Self {
+        self.reaction.conditions.push(condition);
         self
     }
 

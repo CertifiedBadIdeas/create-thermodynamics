@@ -540,7 +540,9 @@ fn electronegativity(element: &str) -> ChemistryResult<f64> {
         "N" => 3.04,
         "O" => 3.44,
         "F" => 3.98,
+        "Li" => 0.98,
         "Na" => 0.93,
+        "Mg" => 1.31,
         "P" => 2.19,
         "S" => 2.58,
         "Cl" => 3.16,
@@ -923,6 +925,9 @@ mod tests {
         let reaction = registry.reaction(&"destroy:acidic_redox".into()).unwrap();
 
         let mut without_acid = Mixture::new(298.0).unwrap();
+        without_acid
+            .add_substance(&registry, "destroy:water", 1.0)
+            .unwrap();
         without_acid
             .add_substance(&registry, "destroy:iron_ii", 0.2)
             .unwrap();
