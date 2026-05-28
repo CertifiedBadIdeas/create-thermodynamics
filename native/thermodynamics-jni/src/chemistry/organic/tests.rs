@@ -493,3 +493,217 @@ fn heteroatom_generators_are_registered() {
     reaction_with_prefix(&registry, "thionyl_chloride_substitution/destroy_ethanol/");
     reaction_with_prefix(&registry, "wolff_kishner_reduction/destroy_acetone/");
 }
+
+#[test]
+fn selectivity_engine_integration_prevents_tertiary_reactions() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    
+    // 1. Esterification test
+    let acetic_acid = SubstanceId::from("destroy:acetic_acid");
+    let tert_butanol = dynamic.resolve_frowns("CC(C)(C)O").unwrap(); // 3° alcohol
+    let ethanol = SubstanceId::from("destroy:ethanol"); // 1° alcohol
+
+    // Generate reactions for acetic acid + tert-butanol (3° alcohol)
+    dynamic
+        .generate_reactions_for_substances([acetic_acid.clone(), tert_butanol], 1)
+        .unwrap();
+    
+    // There should NOT be an esterification reaction for tert-butanol
+    let tert_esterification_exists = dynamic.reactions().any(|reaction| {
+        reaction.id.as_str().contains("carboxylic_acid_esterification")
+            && !reaction.id.as_str().contains("ethanol")
+    });
+    assert!(!tert_esterification_exists, "Esterification must be suppressed for tertiary alcohols");
+
+    // Generate reactions for acetic acid + ethanol (1° alcohol)
+    dynamic
+        .generate_reactions_for_substances([acetic_acid, ethanol], 1)
+        .unwrap();
+    
+    // There SHOULD be an esterification reaction for ethanol
+    let eth_esterification_exists = dynamic.reactions().any(|reaction| {
+        reaction.id.as_str().contains("carboxylic_acid_esterification")
+            && reaction.id.as_str().contains("ethanol")
+    });
+    assert!(eth_esterification_exists, "Esterification should proceed for primary alcohols");
+
+    // 2. SN2 Halide Substitution test
+    let tert_butyl_chloride = dynamic.resolve_frowns("CC(C)(C)Cl").unwrap(); // 3° halide
+    let chloroethane = SubstanceId::from("destroy:chloroethane"); // 1° halide
+
+    // Generate reactions for tert-butyl chloride (3° halide)
+    dynamic
+        .generate_reactions_for_substances([tert_butyl_chloride], 1)
+        .unwrap();
+
+    // There should NOT be an SN2 hydroxide substitution for 3° halide
+    let tert_substitution_exists = dynamic.reactions().any(|reaction| {
+        reaction.id.as_str().contains("halide_hydroxide_substitution")
+            && !reaction.id.as_str().contains("chloroethane")
+    });
+    assert!(!tert_substitution_exists, "SN2 substitution must be suppressed for tertiary halides");
+
+    // Generate reactions for chloroethane (1° halide)
+    dynamic
+        .generate_reactions_for_substances([chloroethane], 1)
+        .unwrap();
+
+    // There SHOULD be an SN2 hydroxide substitution for 1° halide
+    let eth_substitution_exists = dynamic.reactions().any(|reaction| {
+        reaction.id.as_str().contains("halide_hydroxide_substitution")
+            && reaction.id.as_str().contains("chloroethane")
+    });
+    assert!(eth_substitution_exists, "SN2 substitution should proceed for primary halides");
+}
+
+#[test]
+fn test_aromatic_eas_directing_groups_and_deactivation() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+
+    // 1. Unsubstituted Benzene (already in catalog as destroy:benzene)
+    let benzene = SubstanceId::from("destroy:benzene");
+    dynamic.generate_reactions_for_substances([benzene.clone()], 1).unwrap();
+
+    // Verify all four single-site EAS reactions exist for benzene
+    let nitration_exists = dynamic.reactions().any(|r| r.id.as_str().contains("aromatic_nitration") && r.id.as_str().contains("benzene"));
+    let chlorination_exists = dynamic.reactions().any(|r| r.id.as_str().contains("aromatic_chlorination") && r.id.as_str().contains("benzene"));
+    let bromination_exists = dynamic.reactions().any(|r| r.id.as_str().contains("aromatic_bromination") && r.id.as_str().contains("benzene"));
+    let sulfonation_exists = dynamic.reactions().any(|r| r.id.as_str().contains("aromatic_sulfonation") && r.id.as_str().contains("benzene"));
+
+    assert!(nitration_exists, "Benzene must undergo nitration");
+    assert!(chlorination_exists, "Benzene must undergo chlorination");
+    assert!(bromination_exists, "Benzene must undergo bromination");
+    assert!(sulfonation_exists, "Benzene must undergo sulfonation");
+
+    // 2. Friedel-Crafts on Benzene
+    let chloroethane = SubstanceId::from("destroy:chloroethane");
+    let acetyl_chloride = SubstanceId::from("destroy:acetyl_chloride");
+    dynamic.generate_reactions_for_substances([benzene.clone(), chloroethane.clone(), acetyl_chloride.clone()], 1).unwrap();
+
+    let fc_alkylation_exists = dynamic.reactions().any(|r| r.id.as_str().contains("fc_alkylation") && r.id.as_str().contains("benzene"));
+    let fc_acylation_exists = dynamic.reactions().any(|r| r.id.as_str().contains("fc_acylation") && r.id.as_str().contains("benzene"));
+    assert!(fc_alkylation_exists, "Benzene must undergo Friedel-Crafts alkylation");
+    assert!(fc_acylation_exists, "Benzene must undergo Friedel-Crafts acylation");
+
+    // 3. Toluene (Weakly Activating Ortho/Para-director)
+    // Graph FROWNS: 7 carbons (ring 0-5 + methyl 6), 8 hydrogens (methyl 7-9 + ring 10-14)
+    let toluene = dynamic.resolve_frowns(
+        "destroy:graph:atoms=C.C.C.C.C.C.C.H.H.H.H.H.H.H.H;bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,0-s-6,6-s-7,6-s-8,6-s-9,1-s-10,2-s-11,3-s-12,4-s-13,5-s-14"
+    ).unwrap();
+    dynamic.generate_reactions_for_substances([toluene.clone()], 1).unwrap();
+
+    // Get the toluene nitration reaction and inspect the channel activation energies
+    let toluene_nitration = dynamic.reactions().find(|r| r.id.as_str().contains("aromatic_nitration") && r.id.as_str().contains("toluene"))
+        .expect("Toluene must undergo nitration");
+    
+    // There should be multiple channels (ortho, meta, para)
+    assert!(toluene_nitration.channels.len() > 1, "Toluene nitration must have multiple regioselective channels");
+    
+    let channels = &toluene_nitration.channels;
+    let mut energies: Vec<f64> = channels.iter().map(|c| c.activation_gibbs_kj_per_mol).collect::<Vec<_>>();
+    energies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    
+    // Lowest Ea should be 30.0 - 5.0 = 25.0 kcal/mol (para)
+    // Ortho positions should be 30.0 - 4.0 = 26.0 kcal/mol
+    // Meta positions should be 30.0 - 1.0 = 29.0 kcal/mol
+    assert!((energies[0] - 25.0).abs() < 1e-3, "Para-nitration Ea should be 25.0 kcal/mol, got {}", energies[0]);
+    assert!((energies[1] - 26.0).abs() < 1e-3, "Ortho-nitration Ea should be 26.0 kcal/mol, got {}", energies[1]);
+    assert!((energies[energies.len() - 2] - 29.0).abs() < 1e-3, "Meta-nitration Ea should be 29.0 kcal/mol, got {}", energies[energies.len() - 2]);
+
+    // 4. Nitrobenzene (Strongly Deactivating Meta-director)
+    // Zwitterionic representation: C-N(=O)O- with N+ and O-
+    let nitrobenzene = dynamic.resolve_frowns(
+        "destroy:graph:atoms=C.C.C.C.C.C.N^1.O.O^-1.H.H.H.H.H;bonds=0-s-6,6-d-7,6-s-8,1-s-9,2-s-10,3-s-11,4-s-12,5-s-13,0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0"
+    ).unwrap();
+    dynamic.generate_reactions_for_substances([nitrobenzene.clone()], 1).unwrap();
+
+    // Find nitration reaction for nitrobenzene by its substance ID
+    // Find nitrobenzene nitration by matching reactant substance ID instead of
+    // prefix-matching the reaction ID (which has sanitized slashes from graph FROWNS).
+    let nitro_nitration = dynamic.reactions().find(|r| {
+        r.id.as_str().starts_with("aromatic_nitration/")
+            && r.reactants
+                .first()
+                .is_some_and(|term| term.substance_id == nitrobenzene)
+    })
+        .expect("Nitrobenzene must undergo nitration");
+
+    // Class: StronglyDeactivating (-NO2). Ortho (+15.0), Meta (+9.0), Para (+16.0)
+    // Therefore, Meta-nitration has the lowest activation energy (30.0 + 9.0 = 39.0 kcal/mol)
+    let mut nitro_energies: Vec<f64> = nitro_nitration.channels.iter().map(|c| c.activation_gibbs_kj_per_mol).collect::<Vec<_>>();
+    nitro_energies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    
+    assert!((nitro_energies[0] - 39.0).abs() < 1e-3, "Meta-nitration of nitrobenzene must have Ea of 39.0 kcal/mol, got {}", nitro_energies[0]);
+    assert!(nitro_energies[2] > 44.0, "Ortho/Para-nitration must be highly deactivated, got {}", nitro_energies[2]);
+
+    // 5. Friedel-Crafts Deactivation Blocking Rule
+    dynamic.generate_reactions_for_substances([nitrobenzene.clone(), chloroethane], 1).unwrap();
+
+    let fc_prefix = format!("fc_alkylation/{}", nitrobenzene.as_str());
+    let nitro_fc_exists = dynamic.reactions().any(|r| {
+        r.id.as_str().starts_with(&fc_prefix)
+    });
+    assert!(!nitro_fc_exists, "Friedel-Crafts alkylation must be completely blocked on deactivated nitrobenzene");
+}
+
+#[test]
+fn toluene_can_be_nitrated_dynamically() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+
+    let toluene = dynamic.resolve_frowns(
+        "destroy:graph:atoms=C.C.C.C.C.C.C.H.H.H.H.H.H.H.H;bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,0-s-6,6-s-7,6-s-8,6-s-9,1-s-10,2-s-11,3-s-12,4-s-13,5-s-14"
+    ).unwrap();
+
+    dynamic.generate_reactions_for_substances([toluene.clone()], 1).unwrap();
+
+    let nitration = dynamic.reactions().find(|r| {
+        r.id.as_str().starts_with("aromatic_nitration/")
+            && r.reactants.first().is_some_and(|t| t.substance_id == toluene)
+    })
+    .expect("Toluene must undergo nitration");
+
+    assert!(nitration.channels.len() >= 2, "Toluene should have multiple regioselective nitration channels");
+    assert!(nitration.reactants.iter().any(|t| t.substance_id == toluene));
+    // Products are stored in channels when there are multiple regioselective positions
+    assert!(nitration.channels.iter().any(|c| !c.products.is_empty()), "Nitration channels should contain products");
+}
+
+#[test]
+fn snar_on_nitrochlorobenzene() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+
+    // o-Nitrochlorobenzene: NO₂ ortho to Cl (strongest SNAr activation)
+    // Ring: C0(NO₂)-C1(Cl)-C2-C3-C4-C5
+    // NO₂ represented as zwitterion N⁺—O⁻ and N⁺=O
+    let o_nitrochlorobenzene = dynamic.resolve_frowns(
+        "destroy:graph:atoms=C.C.C.C.C.C.N^1.O.O^-1.Cl.H.H.H.H;bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,0-s-6,6-d-7,6-s-8,1-s-9,2-s-10,3-s-11,4-s-12,5-s-13"
+    ).unwrap();
+
+    dynamic.generate_reactions_for_substances([o_nitrochlorobenzene.clone()], 1).unwrap();
+
+    // SNAr with hydroxide should exist (NO₂ activates the ring)
+    let snar_oh = dynamic.reactions().find(|r| {
+        r.id.as_str().starts_with("aryl_halide_hydroxide_substitution/")
+            && r.reactants.first().is_some_and(|t| t.substance_id == o_nitrochlorobenzene)
+    })
+    .expect("Nitrochlorobenzene must undergo SNAr with hydroxide");
+
+    assert!(snar_oh.reactants.iter().any(|t| t.substance_id.as_str() == "destroy:hydroxide"),
+        "Hydroxide must be a reactant in SNAr");
+    assert!(snar_oh.products.len() > 0,
+        "SNAr must produce a substituted product");
+
+    // SNAr with ammonia should also exist
+    let snar_nh3 = dynamic.reactions().find(|r| {
+        r.id.as_str().starts_with("aryl_halide_ammonia_substitution/")
+            && r.reactants.first().is_some_and(|t| t.substance_id == o_nitrochlorobenzene)
+    })
+    .expect("Nitrochlorobenzene must undergo SNAr with ammonia");
+
+    assert!(snar_nh3.reactants.iter().any(|t| t.substance_id.as_str() == "destroy:ammonia"),
+        "Ammonia must be a reactant in SNAr");
+}
