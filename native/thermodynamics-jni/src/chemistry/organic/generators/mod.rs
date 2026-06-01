@@ -7,6 +7,8 @@ pub(super) mod carbonyl;
 pub(super) mod common;
 pub(super) mod enolate;
 pub(super) mod heteroatom;
+pub(super) mod phosphorus;
+pub(super) mod protecting_groups;
 pub(super) mod substitution;
 
 pub(super) use acid_derivatives::*;
@@ -18,4 +20,6 @@ pub(super) use carbonyl::*;
 pub(super) use common::*;
 pub(super) use enolate::*;
 pub(super) use heteroatom::*;
+pub(super) use phosphorus::*;
+pub(super) use protecting_groups::*;
 pub(super) use substitution::*;

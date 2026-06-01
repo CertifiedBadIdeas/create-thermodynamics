@@ -36,12 +36,67 @@ pub(crate) struct CarbonylSite<'a> {
     pub(crate) is_ketone: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphaCarbonylKind {
+    Aldehyde,
+    Ketone,
+    Ester,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphaAcidityClass {
+    Ordinary,
+    Activated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphaStericClass {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphaConjugation {
+    None,
+    Allylic,
+    Benzylic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YlideStability {
+    Unstabilized,
+    SemiStabilized,
+    Stabilized,
+}
+
+#[derive(Clone)]
+pub(crate) struct AlphaCarbonCenter<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) carbonyl_carbon: usize,
+    pub(crate) carbonyl_oxygen: usize,
+    pub(crate) alpha_carbon: usize,
+    pub(crate) alpha_hydrogens: Vec<usize>,
+    pub(crate) carbonyl_kind: AlphaCarbonylKind,
+    pub(crate) acidity: AlphaAcidityClass,
+    pub(crate) steric_class: AlphaStericClass,
+    pub(crate) conjugation: AlphaConjugation,
+}
+
 #[derive(Clone)]
 pub(crate) struct CarboxylicAcidSite<'a> {
     pub(crate) participant: SiteParticipant<'a>,
     pub(crate) carbon: usize,
     pub(crate) hydroxyl_oxygen: usize,
     pub(crate) hydroxyl_hydrogen: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct EsterSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) carbon: usize,
+    pub(crate) carbonyl_oxygen: usize,
+    pub(crate) alkoxy_oxygen: usize,
 }
 
 #[derive(Clone)]
@@ -64,6 +119,42 @@ pub(crate) struct AmineSite<'a> {
     pub(crate) participant: SiteParticipant<'a>,
     pub(crate) nitrogen: usize,
     pub(crate) hydrogens: Vec<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PhosphineSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) phosphorus: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct PhosphoniumSaltSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) phosphorus: usize,
+    pub(crate) alpha_carbon: usize,
+    pub(crate) alpha_hydrogens: Vec<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PhosphorusYlideSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) phosphorus: usize,
+    pub(crate) alpha_carbon: usize,
+    pub(crate) stability: YlideStability,
+}
+
+#[derive(Clone)]
+pub(crate) struct PhosphonateCarbanionSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) phosphorus: usize,
+    pub(crate) alpha_carbon: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SulfoneCarbanionSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) sulfur: usize,
+    pub(crate) alpha_carbon: usize,
 }
 
 #[derive(Clone)]
@@ -115,6 +206,41 @@ pub(crate) struct ArylHalideSite<'a> {
     pub(crate) participant: SiteParticipant<'a>,
     pub(crate) carbon: usize,
     pub(crate) halogen: usize,
+}
+
+// Protecting group center types
+#[derive(Clone)]
+pub(crate) struct SilylEtherCenter<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) oxygen: usize,
+    pub(crate) silicon: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct AcetalCenter<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) acetal_carbon: usize,
+    pub(crate) oxygen_a: usize,
+    pub(crate) oxygen_b: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct BocCarbamateCenter<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) nitrogen: usize,
+    pub(crate) carbonyl_carbon: usize,
+    pub(crate) carbonyl_oxygen: usize,
+    pub(crate) alkoxy_oxygen: usize,
+    pub(crate) tert_butyl_carbon: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct CbzCarbamateCenter<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) nitrogen: usize,
+    pub(crate) carbonyl_carbon: usize,
+    pub(crate) carbonyl_oxygen: usize,
+    pub(crate) alkoxy_oxygen: usize,
 }
 
 impl<'a> SiteParticipant<'a> {
@@ -213,6 +339,67 @@ impl<'a> SiteParticipant<'a> {
         })
     }
 
+    pub(crate) fn alpha_carbon_center(self) -> ChemistryResult<AlphaCarbonCenter<'a>> {
+        if !matches!(
+            self.site.kind,
+            ReactiveSiteKind::Enol | ReactiveSiteKind::Enolate
+        ) {
+            return Err(self.site_error("site is not an alpha carbon center"));
+        }
+        let (carbonyl_carbon, carbonyl_oxygen) =
+            carbonyl_atoms_from_site(self.structure, &self.site, "alpha carbon")?;
+        let alpha_carbon =
+            self.site
+                .atoms
+                .iter()
+                .copied()
+                .find(|atom| {
+                    *atom != carbonyl_carbon
+                        && self.structure.atoms[*atom].element == "C"
+                        && self.structure.neighbors(carbonyl_carbon).iter().any(
+                            |(neighbor, order)| {
+                                *neighbor == *atom
+                                    && crate::chemistry::molecule::bond_order_matches(*order, 1.0)
+                            },
+                        )
+                })
+                .ok_or_else(|| self.site_error("alpha center has no alpha carbon"))?;
+        let alpha_hydrogens = bonded_hydrogens(self.structure, alpha_carbon);
+        if alpha_hydrogens.is_empty() {
+            return Err(self.site_error("alpha carbon has no explicit hydrogen"));
+        }
+        let carbonyl_kind = alpha_carbonyl_kind(self.structure, carbonyl_carbon, carbonyl_oxygen);
+        let acidity = if has_second_carbonyl_neighbor(self.structure, alpha_carbon, carbonyl_carbon)
+        {
+            AlphaAcidityClass::Activated
+        } else {
+            AlphaAcidityClass::Ordinary
+        };
+        let carbon_neighbors = self
+            .structure
+            .neighbors(alpha_carbon)
+            .into_iter()
+            .filter(|(neighbor, _)| self.structure.atoms[*neighbor].element == "C")
+            .count();
+        let steric_class = match carbon_neighbors {
+            0 | 1 => AlphaStericClass::Primary,
+            2 => AlphaStericClass::Secondary,
+            _ => AlphaStericClass::Tertiary,
+        };
+        let conjugation = alpha_conjugation(self.structure, alpha_carbon, carbonyl_carbon);
+        Ok(AlphaCarbonCenter {
+            participant: self,
+            carbonyl_carbon,
+            carbonyl_oxygen,
+            alpha_carbon,
+            alpha_hydrogens,
+            carbonyl_kind,
+            acidity,
+            steric_class,
+            conjugation,
+        })
+    }
+
     pub(crate) fn carboxylic_acid_site(self) -> ChemistryResult<CarboxylicAcidSite<'a>> {
         self.require_kind(ReactiveSiteKind::CarboxylicAcid)?;
         let (carbon, carbonyl_oxygen) =
@@ -235,6 +422,29 @@ impl<'a> SiteParticipant<'a> {
             carbon,
             hydroxyl_oxygen,
             hydroxyl_hydrogen,
+        })
+    }
+
+    pub(crate) fn ester_site(self) -> ChemistryResult<EsterSite<'a>> {
+        self.require_kind(ReactiveSiteKind::Ester)?;
+        let (carbon, carbonyl_oxygen) =
+            carbonyl_atoms_from_site(self.structure, &self.site, "ester")?;
+        let alkoxy_oxygen = self
+            .structure
+            .neighbors(carbon)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != carbonyl_oxygen
+                    && self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("ester has no alkoxy oxygen"))?;
+        Ok(EsterSite {
+            participant: self,
+            carbon,
+            carbonyl_oxygen,
+            alkoxy_oxygen,
         })
     }
 
@@ -288,6 +498,164 @@ impl<'a> SiteParticipant<'a> {
             participant: self,
             nitrogen,
             hydrogens,
+        })
+    }
+
+    pub(crate) fn phosphine_site(self) -> ChemistryResult<PhosphineSite<'a>> {
+        self.require_kind(ReactiveSiteKind::Phosphine)?;
+        let phosphorus = self.site_atom_by_element("P", "phosphine phosphorus")?;
+        let substituents = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .filter_map(|(neighbor, order)| {
+                crate::chemistry::molecule::bond_order_matches(order, 1.0).then_some(neighbor)
+            })
+            .collect::<Vec<_>>();
+        if substituents.len() != 3 {
+            return Err(self.site_error("phosphine must be a neutral tertiary phosphine"));
+        }
+        Ok(PhosphineSite {
+            participant: self,
+            phosphorus,
+        })
+    }
+
+    pub(crate) fn phosphonium_salt_site(self) -> ChemistryResult<PhosphoniumSaltSite<'a>> {
+        self.require_kind(ReactiveSiteKind::PhosphoniumSalt)?;
+        let phosphorus = self.site_atom_by_element("P", "phosphonium phosphorus")?;
+        let alpha_carbon = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("phosphonium salt has no alpha carbon"))?;
+        let alpha_hydrogens = bonded_hydrogens(self.structure, alpha_carbon);
+        if alpha_hydrogens.is_empty() {
+            return Err(self.site_error("phosphonium salt has no explicit alpha hydrogen"));
+        }
+        let substituents = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .filter_map(|(neighbor, order)| {
+                (neighbor != alpha_carbon
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .collect::<Vec<_>>();
+        if substituents.len() != 3 {
+            return Err(self.site_error("phosphonium salt must have three phosphorus substituents"));
+        }
+        Ok(PhosphoniumSaltSite {
+            participant: self,
+            phosphorus,
+            alpha_carbon,
+            alpha_hydrogens,
+        })
+    }
+
+    pub(crate) fn phosphorus_ylide_site(self) -> ChemistryResult<PhosphorusYlideSite<'a>> {
+        self.require_kind(ReactiveSiteKind::PhosphorusYlide)?;
+        let phosphorus = self.site_atom_by_element("P", "phosphorus ylide phosphorus")?;
+        let alpha_carbon = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("phosphorus ylide has no alpha carbon"))?;
+        let substituents = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .filter_map(|(neighbor, order)| {
+                (neighbor != alpha_carbon
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .collect::<Vec<_>>();
+        if substituents.len() != 3 {
+            return Err(self.site_error("phosphorus ylide must have three phosphorus substituents"));
+        }
+        let stability = phosphorus_ylide_stability(self.structure, alpha_carbon);
+        Ok(PhosphorusYlideSite {
+            participant: self,
+            phosphorus,
+            alpha_carbon,
+            stability,
+        })
+    }
+
+    pub(crate) fn phosphonate_carbanion_site(
+        self,
+    ) -> ChemistryResult<PhosphonateCarbanionSite<'a>> {
+        self.require_kind(ReactiveSiteKind::PhosphonateCarbanion)?;
+        let phosphorus = self.site_atom_by_element("P", "phosphonate phosphorus")?;
+        let alpha_carbon = self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "C"
+                    && self.structure.atoms[neighbor].charge < -0.1
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("phosphonate has no anionic alpha carbon"))?;
+        self
+            .structure
+            .neighbors(phosphorus)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 2.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("phosphonate has no phosphoryl oxygen"))?;
+        Ok(PhosphonateCarbanionSite {
+            participant: self,
+            phosphorus,
+            alpha_carbon,
+        })
+    }
+
+    pub(crate) fn sulfone_carbanion_site(self) -> ChemistryResult<SulfoneCarbanionSite<'a>> {
+        self.require_kind(ReactiveSiteKind::SulfoneCarbanion)?;
+        let sulfur = self.site_atom_by_element("S", "sulfone sulfur")?;
+        let alpha_carbon = self
+            .structure
+            .neighbors(sulfur)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "C"
+                    && self.structure.atoms[neighbor].charge < -0.1
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("sulfone has no anionic alpha carbon"))?;
+        let oxygens = self
+            .structure
+            .neighbors(sulfur)
+            .into_iter()
+            .filter_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "O" && order >= 1.5).then_some(neighbor)
+            })
+            .collect::<Vec<_>>();
+        if oxygens.len() < 2 {
+            return Err(self.site_error("sulfone carbanion has fewer than two sulfone oxygens"));
+        }
+        Ok(SulfoneCarbanionSite {
+            participant: self,
+            sulfur,
+            alpha_carbon,
         })
     }
 
@@ -411,6 +779,132 @@ impl<'a> SiteParticipant<'a> {
         })
     }
 
+    // Protecting group center methods
+    pub(crate) fn silyl_ether_center(self) -> ChemistryResult<SilylEtherCenter<'a>> {
+        self.require_kind(ReactiveSiteKind::SilylEther)?;
+        let oxygen = self.site_atom_by_element("O", "silyl ether oxygen")?;
+        let silicon = self.bonded_site_atom(oxygen, "Si", 1.0, "silyl ether silicon")?;
+        self
+            .structure
+            .neighbors(oxygen)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != silicon
+                    && self.structure.atoms[neighbor].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("silyl ether oxygen has no carbon neighbor"))?;
+        Ok(SilylEtherCenter {
+            participant: self,
+            oxygen,
+            silicon,
+        })
+    }
+
+    pub(crate) fn acetal_center(self) -> ChemistryResult<AcetalCenter<'a>> {
+        if !matches!(self.site.kind, ReactiveSiteKind::Acetal | ReactiveSiteKind::Ketal) {
+            return Err(self.site_error("site is not an acetal or ketal center"));
+        }
+        let acetal_carbon = self.site_atom_by_element("C", "acetal carbon")?;
+        let oxygens = self
+            .structure
+            .neighbors(acetal_carbon)
+            .into_iter()
+            .filter_map(|(neighbor, order)| {
+                (self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .collect::<Vec<_>>();
+        if oxygens.len() < 2 {
+            return Err(self.site_error("acetal center must have two single-bonded oxygens"));
+        }
+        Ok(AcetalCenter {
+            participant: self,
+            acetal_carbon,
+            oxygen_a: oxygens[0],
+            oxygen_b: oxygens[1],
+        })
+    }
+
+    pub(crate) fn boc_carbamate_center(self) -> ChemistryResult<BocCarbamateCenter<'a>> {
+        self.require_kind(ReactiveSiteKind::BocCarbamate)?;
+        let nitrogen = self.site_atom_by_element("N", "Boc carbamate nitrogen")?;
+        let carbonyl_carbon =
+            self.bonded_site_atom(nitrogen, "C", 1.0, "Boc carbamate carbonyl carbon")?;
+        let carbonyl_oxygen =
+            self.bonded_site_atom(carbonyl_carbon, "O", 2.0, "Boc carbonyl oxygen")?;
+        let alkoxy_oxygen = self
+            .structure
+            .neighbors(carbonyl_carbon)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != carbonyl_oxygen
+                    && self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("Boc carbamate has no alkoxy oxygen"))?;
+        let tert_butyl_carbon = self
+            .structure
+            .neighbors(alkoxy_oxygen)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != carbonyl_carbon
+                    && self.structure.atoms[neighbor].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("Boc carbamate has no tert-butyl carbon"))?;
+        Ok(BocCarbamateCenter {
+            participant: self,
+            nitrogen,
+            carbonyl_carbon,
+            carbonyl_oxygen,
+            alkoxy_oxygen,
+            tert_butyl_carbon,
+        })
+    }
+
+    pub(crate) fn cbz_carbamate_center(self) -> ChemistryResult<CbzCarbamateCenter<'a>> {
+        self.require_kind(ReactiveSiteKind::CbzCarbamate)?;
+        let nitrogen = self.site_atom_by_element("N", "Cbz carbamate nitrogen")?;
+        let carbonyl_carbon =
+            self.bonded_site_atom(nitrogen, "C", 1.0, "Cbz carbamate carbonyl carbon")?;
+        let carbonyl_oxygen =
+            self.bonded_site_atom(carbonyl_carbon, "O", 2.0, "Cbz carbonyl oxygen")?;
+        let alkoxy_oxygen = self
+            .structure
+            .neighbors(carbonyl_carbon)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != carbonyl_oxygen
+                    && self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("Cbz carbamate has no alkoxy oxygen"))?;
+        self
+            .structure
+            .neighbors(alkoxy_oxygen)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != carbonyl_carbon
+                    && self.structure.atoms[neighbor].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| self.site_error("Cbz carbamate has no benzyl carbon"))?;
+        Ok(CbzCarbamateCenter {
+            participant: self,
+            nitrogen,
+            carbonyl_carbon,
+            carbonyl_oxygen,
+            alkoxy_oxygen,
+        })
+    }
+
     pub(crate) fn site_atom_by_element(
         &self,
         element: &str,
@@ -449,4 +943,112 @@ impl<'a> SiteParticipant<'a> {
             reason: reason.to_string(),
         }
     }
+}
+
+fn alpha_carbonyl_kind(
+    structure: &crate::chemistry::molecule::MolecularStructure,
+    carbonyl_carbon: usize,
+    carbonyl_oxygen: usize,
+) -> AlphaCarbonylKind {
+    if structure
+        .neighbors(carbonyl_carbon)
+        .into_iter()
+        .any(|(neighbor, order)| {
+            neighbor != carbonyl_oxygen
+                && structure.atoms[neighbor].element == "O"
+                && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+        })
+    {
+        AlphaCarbonylKind::Ester
+    } else if first_bonded_hydrogen(structure, carbonyl_carbon).is_some() {
+        AlphaCarbonylKind::Aldehyde
+    } else {
+        AlphaCarbonylKind::Ketone
+    }
+}
+
+fn has_second_carbonyl_neighbor(
+    structure: &crate::chemistry::molecule::MolecularStructure,
+    alpha_carbon: usize,
+    first_carbonyl: usize,
+) -> bool {
+    structure
+        .neighbors(alpha_carbon)
+        .into_iter()
+        .any(|(neighbor, order)| {
+            neighbor != first_carbonyl
+                && structure.atoms[neighbor].element == "C"
+                && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+                && structure
+                    .neighbors(neighbor)
+                    .into_iter()
+                    .any(|(other, bond_order)| {
+                        structure.atoms[other].element == "O"
+                            && crate::chemistry::molecule::bond_order_matches(bond_order, 2.0)
+                    })
+        })
+}
+
+fn alpha_conjugation(
+    structure: &crate::chemistry::molecule::MolecularStructure,
+    alpha_carbon: usize,
+    carbonyl_carbon: usize,
+) -> AlphaConjugation {
+    for (neighbor, order) in structure.neighbors(alpha_carbon) {
+        if neighbor == carbonyl_carbon || structure.atoms[neighbor].element != "C" {
+            continue;
+        }
+        if crate::chemistry::molecule::bond_order_matches(order, 1.5) {
+            return AlphaConjugation::Benzylic;
+        }
+        if structure
+            .neighbors(neighbor)
+            .into_iter()
+            .any(|(other, bond_order)| {
+                other != alpha_carbon
+                    && structure.atoms[other].element == "C"
+                    && crate::chemistry::molecule::bond_order_matches(bond_order, 2.0)
+            })
+        {
+            return AlphaConjugation::Allylic;
+        }
+    }
+    AlphaConjugation::None
+}
+
+fn phosphorus_ylide_stability(
+    structure: &crate::chemistry::molecule::MolecularStructure,
+    alpha_carbon: usize,
+) -> YlideStability {
+    if structure
+        .neighbors(alpha_carbon)
+        .into_iter()
+        .any(|(neighbor, order)| {
+            neighbor != alpha_carbon
+                && structure.atoms[neighbor].element == "C"
+                && crate::chemistry::molecule::bond_order_matches(order, 2.0)
+        })
+    {
+        return YlideStability::Stabilized;
+    }
+    if structure
+        .neighbors(alpha_carbon)
+        .into_iter()
+        .any(|(neighbor, order)| {
+            neighbor != alpha_carbon
+                && structure.atoms[neighbor].element == "C"
+                && (crate::chemistry::molecule::bond_order_matches(order, 1.5)
+                    || structure
+                        .neighbors(neighbor)
+                        .into_iter()
+                        .any(|(other, bond_order)| {
+                            other != alpha_carbon
+                                && structure.atoms[other].element == "C"
+                                && crate::chemistry::molecule::bond_order_matches(bond_order, 2.0)
+                        }))
+        })
+    {
+        return YlideStability::SemiStabilized;
+    }
+    YlideStability::Unstabilized
 }

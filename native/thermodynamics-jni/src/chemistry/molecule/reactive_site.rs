@@ -41,9 +41,19 @@ pub enum ReactiveSiteKind {
     Organomagnesium,
     Phenol,
     PrimaryAmine,
+    Phosphine,
+    PhosphonateCarbanion,
+    PhosphoniumSalt,
+    PhosphorusYlide,
+    SulfoneCarbanion,
     Sulfide,
     SulfonylChloride,
     Thiol,
+    SilylEther,
+    Acetal,
+    Ketal,
+    BocCarbamate,
+    CbzCarbamate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -278,12 +288,40 @@ pub fn try_find_reactive_sites(
                 ReactiveSiteKind::PrimaryAmine,
                 vec![ReactiveRole::Nucleophile],
             ),
+            FunctionalGroupType::Phosphine => {
+                (ReactiveSiteKind::Phosphine, vec![ReactiveRole::Nucleophile])
+            }
+            FunctionalGroupType::PhosphonateCarbanion => (
+                ReactiveSiteKind::PhosphonateCarbanion,
+                vec![ReactiveRole::Nucleophile],
+            ),
+            FunctionalGroupType::PhosphoniumSalt => (
+                ReactiveSiteKind::PhosphoniumSalt,
+                vec![ReactiveRole::AcidicProton],
+            ),
+            FunctionalGroupType::PhosphorusYlide => (
+                ReactiveSiteKind::PhosphorusYlide,
+                vec![ReactiveRole::Nucleophile],
+            ),
+            FunctionalGroupType::SulfoneCarbanion => (
+                ReactiveSiteKind::SulfoneCarbanion,
+                vec![ReactiveRole::Nucleophile],
+            ),
             FunctionalGroupType::UnsubstitutedAmide => {
                 (ReactiveSiteKind::Amide, vec![ReactiveRole::Electrophile])
             }
+            FunctionalGroupType::SilylEther => (ReactiveSiteKind::SilylEther, vec![]),
+            FunctionalGroupType::Acetal => (ReactiveSiteKind::Acetal, vec![]),
+            FunctionalGroupType::Ketal => (ReactiveSiteKind::Ketal, vec![]),
+            FunctionalGroupType::BocCarbamate => (ReactiveSiteKind::BocCarbamate, vec![]),
+            FunctionalGroupType::CbzCarbamate => (ReactiveSiteKind::CbzCarbamate, vec![]),
         };
         sites.push(ReactiveSite::new(kind, group.atoms, roles));
     }
+
+    // Remove conflicting sites: protected functional groups should not have their
+    // original reactive sites detected
+    remove_conflicting_protected_sites(structure, &mut sites);
 
     add_aromatic_sites(structure, &mut sites);
     add_oxygen_sites(structure, &mut sites);
@@ -410,6 +448,28 @@ fn add_sulfur_sites(structure: &MolecularStructure, sites: &mut Vec<ReactiveSite
                 [ReactiveRole::Electrophile, ReactiveRole::LeavingGroup],
             ));
         }
+        for (carbon, order) in &neighbors {
+            if bond_order_matches(*order, 1.0)
+                && structure.atoms[*carbon].element == "C"
+                && structure.atoms[*carbon].charge < -0.1
+                && oxygens >= 2
+            {
+                let mut atoms = vec![sulfur, *carbon];
+                atoms.extend(
+                    neighbors
+                        .iter()
+                        .filter(|(neighbor, order)| {
+                            structure.atoms[*neighbor].element == "O" && *order >= 1.5
+                        })
+                        .map(|(neighbor, _)| *neighbor),
+                );
+                sites.push(ReactiveSite::new(
+                    ReactiveSiteKind::SulfoneCarbanion,
+                    atoms,
+                    [ReactiveRole::Nucleophile],
+                ));
+            }
+        }
         if neighbors
             .iter()
             .any(|(neighbor, _)| structure.atoms[*neighbor].element == "H")
@@ -510,8 +570,7 @@ fn add_alpha_sites(structure: &MolecularStructure, sites: &mut Vec<ReactiveSite>
                 ReactiveSiteKind::Aldehyde | ReactiveSiteKind::Ketone | ReactiveSiteKind::Ester
             )
         })
-        .flat_map(|site| site.atoms.iter().copied())
-        .filter(|atom| structure.atoms[*atom].element == "C")
+        .filter_map(|site| carbonyl_carbon_in_site(structure, site))
         .collect::<BTreeSet<_>>();
     for carbonyl in carbonyl_carbons {
         for (neighbor, order) in structure.neighbors(carbonyl) {
@@ -537,6 +596,80 @@ fn is_aromatic_carbon(structure: &MolecularStructure, atom: usize) -> bool {
             .filter(|(_, order)| bond_order_matches(*order, 1.5))
             .count()
             >= 2
+}
+
+/// Remove conflicting sites when a protected functional group is present.
+/// A protected group should not have its original reactive site detected.
+fn remove_conflicting_protected_sites(structure: &MolecularStructure, sites: &mut Vec<ReactiveSite>) {
+    let mut protected_alcohol_oxygens: Vec<usize> = Vec::new();
+    let mut protected_amine_nitrogens: Vec<usize> = Vec::new();
+    let mut protected_carbamate_carbons: Vec<usize> = Vec::new();
+
+    for site in sites.iter() {
+        if site.kind == ReactiveSiteKind::SilylEther {
+            if let Some(&oxygen) = site
+                .atoms
+                .iter()
+                .find(|&&atom| structure.atoms[atom].element == "O")
+            {
+                protected_alcohol_oxygens.push(oxygen);
+            }
+        }
+        if matches!(
+            site.kind,
+            ReactiveSiteKind::BocCarbamate | ReactiveSiteKind::CbzCarbamate
+        ) {
+            if let Some(&nitrogen) = site
+                .atoms
+                .iter()
+                .find(|&&atom| structure.atoms[atom].element == "N")
+            {
+                protected_amine_nitrogens.push(nitrogen);
+            }
+            if let Some(carbon) = carbonyl_carbon_in_site(structure, site) {
+                protected_carbamate_carbons.push(carbon);
+            }
+        }
+    }
+
+    sites.retain(|site| {
+        if site.kind == ReactiveSiteKind::Alcohol
+            && site.atoms.iter().any(|&atom| {
+                structure.atoms[atom].element == "O"
+                    && protected_alcohol_oxygens.contains(&atom)
+            })
+        {
+            return false;
+        }
+        if matches!(
+            site.kind,
+            ReactiveSiteKind::PrimaryAmine | ReactiveSiteKind::NonTertiaryAmine
+        ) && site.atoms.iter().any(|&atom| {
+            structure.atoms[atom].element == "N" && protected_amine_nitrogens.contains(&atom)
+        }) {
+            return false;
+        }
+        if site.kind == ReactiveSiteKind::Ester
+            && site.atoms.iter().any(|&atom| {
+                structure.atoms[atom].element == "C"
+                    && protected_carbamate_carbons.contains(&atom)
+            })
+        {
+            return false;
+        }
+        true
+    });
+}
+
+fn carbonyl_carbon_in_site(structure: &MolecularStructure, site: &ReactiveSite) -> Option<usize> {
+    site.atoms.iter().copied().find(|atom| {
+        structure.atoms[*atom].element == "C"
+            && structure.neighbors(*atom).iter().any(|(neighbor, order)| {
+                site.atoms.contains(neighbor)
+                    && structure.atoms[*neighbor].element == "O"
+                    && bond_order_matches(*order, 2.0)
+            })
+    })
 }
 
 fn enrich_sites(structure: &MolecularStructure, sites: &mut [ReactiveSite]) {
@@ -575,6 +708,8 @@ fn primary_atom_for_site(site: &ReactiveSite) -> Option<usize> {
         | ReactiveSiteKind::AromaticCarbon
         | ReactiveSiteKind::ArylHalide => site.atoms.first().copied(),
         ReactiveSiteKind::AromaticRing => None,
+        ReactiveSiteKind::SilylEther => site.atoms.first().copied(),
+        ReactiveSiteKind::Acetal | ReactiveSiteKind::Ketal => site.atoms.first().copied(),
         _ => site.atoms.first().copied(),
     }
 }

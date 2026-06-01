@@ -8,8 +8,8 @@ use crate::chemistry::error::{ChemistryError, ChemistryResult};
 use crate::chemistry::reaction::Reaction;
 use crate::chemistry::reactive_site::ReactiveSiteKind;
 use crate::chemistry::registry::{ChemistryRegistry, ChemistryRegistryBuilder};
-use crate::chemistry::substance::{Substance, SubstanceId};
 use crate::chemistry::selectivity::types::SelectivityContext;
+use crate::chemistry::substance::{Substance, SubstanceId};
 
 pub fn destroy_registry_with_generated_reactions_builder(
 ) -> ChemistryResult<ChemistryRegistryBuilder> {
@@ -79,10 +79,14 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
-                if let Some(reaction) = generate_halide_ammonia_substitution(&site, &mut resolver, context)? {
+                if let Some(reaction) =
+                    generate_halide_ammonia_substitution(&site, &mut resolver, context)?
+                {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
-                if let Some(reaction) = generate_halide_cyanide_substitution(&site, &mut resolver, context)? {
+                if let Some(reaction) =
+                    generate_halide_cyanide_substitution(&site, &mut resolver, context)?
+                {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
             }
@@ -95,6 +99,8 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
                 let reaction = generate_thionyl_chloride_substitution(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_alcohol_silyl_protection(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
             ReactiveSiteKind::Alkoxide => {
@@ -129,7 +135,8 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 if let Some(reaction) = generate_aldehyde_oxidation(&site, &mut resolver)? {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
-                let reaction = generate_cyanide_nucleophilic_addition(&site, &mut resolver, context)?;
+                let reaction =
+                    generate_cyanide_nucleophilic_addition(&site, &mut resolver, context)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 let reaction = generate_wolff_kishner_reduction(&site, &mut resolver, context)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
@@ -139,15 +146,76 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 let reaction = generate_amide_hydrolysis(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
+            ReactiveSiteKind::Ester => {
+                let site = participant.clone().ester_site()?;
+                let reaction = generate_ester_hydrolysis(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+            }
             ReactiveSiteKind::PrimaryAmine => {
                 let site = participant.clone().amine_site()?;
                 let reaction = generate_amine_phosgenation(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_amine_boc_protection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_amine_cbz_protection(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
             ReactiveSiteKind::NonTertiaryAmine => {
                 let site = participant.clone().amine_site()?;
                 let reaction = generate_cyanamide_addition(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_amine_boc_protection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_amine_cbz_protection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+            }
+            ReactiveSiteKind::PhosphoniumSalt => {
+                let site = participant.clone().phosphonium_salt_site()?;
+                if let Some(reaction) = generate_phosphonium_ylide_formation(&site, &mut resolver)?
+                {
+                    push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
+            }
+            ReactiveSiteKind::PhosphorusYlide => {
+                let ylide_site = participant.clone().phosphorus_ylide_site()?;
+                for carbonyl_kind in carbonyl_site_kinds() {
+                    for carbonyl in space.sites_of(&carbonyl_kind) {
+                        let carbonyl_site = carbonyl.carbonyl_site()?;
+                        if let Some(reaction) =
+                            generate_wittig_olefination(&ylide_site, &carbonyl_site, &mut resolver)?
+                        {
+                            push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                        }
+                    }
+                }
+            }
+            ReactiveSiteKind::PhosphonateCarbanion => {
+                let phosphonate_site = participant.clone().phosphonate_carbanion_site()?;
+                for carbonyl_kind in carbonyl_site_kinds() {
+                    for carbonyl in space.sites_of(&carbonyl_kind) {
+                        let carbonyl_site = carbonyl.carbonyl_site()?;
+                        if let Some(reaction) = generate_horner_wadsworth_emmons_olefination(
+                            &phosphonate_site,
+                            &carbonyl_site,
+                            &mut resolver,
+                        )? {
+                            push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                        }
+                    }
+                }
+            }
+            ReactiveSiteKind::SulfoneCarbanion => {
+                let sulfone_site = participant.clone().sulfone_carbanion_site()?;
+                for carbonyl_kind in carbonyl_site_kinds() {
+                    for carbonyl in space.sites_of(&carbonyl_kind) {
+                        let carbonyl_site = carbonyl.carbonyl_site()?;
+                        if let Some(reaction) =
+                            generate_julia_olefination(&sulfone_site, &carbonyl_site, &mut resolver)?
+                        {
+                            push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                        }
+                    }
+                }
             }
             ReactiveSiteKind::Isocyanate => {
                 let site = participant.clone().isocyanate_site()?;
@@ -175,6 +243,14 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                     };
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
+                for enol in space.sites_of(&ReactiveSiteKind::Enol) {
+                    let center = enol.alpha_carbon_center()?;
+                    if let Some(reaction) =
+                        generate_michael_addition(&center, &site, &mut resolver)?
+                    {
+                        push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                    }
+                }
             }
             ReactiveSiteKind::Alkyne => {
                 let site = participant.clone().unsaturated_bond_site()?;
@@ -187,6 +263,27 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                     };
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
+            }
+            // Protecting group sites - generate deprotection reactions
+            ReactiveSiteKind::SilylEther => {
+                let site = participant.clone().silyl_ether_center()?;
+                let reaction = generate_silyl_ether_deprotection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+            }
+            ReactiveSiteKind::Acetal | ReactiveSiteKind::Ketal => {
+                let site = participant.clone().acetal_center()?;
+                let reaction = generate_acetal_deprotection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+            }
+            ReactiveSiteKind::BocCarbamate => {
+                let site = participant.clone().boc_carbamate_center()?;
+                let reaction = generate_boc_deprotection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+            }
+            ReactiveSiteKind::CbzCarbamate => {
+                let site = participant.clone().cbz_carbamate_center()?;
+                let reaction = generate_cbz_deprotection(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
             _ => {}
         }
@@ -259,15 +356,28 @@ fn is_generator_seed_site(kind: &ReactiveSiteKind) -> bool {
             | ReactiveSiteKind::Aldehyde
             | ReactiveSiteKind::Ketone
             | ReactiveSiteKind::Carbonyl
+            | ReactiveSiteKind::Ester
             | ReactiveSiteKind::Amide
             | ReactiveSiteKind::PrimaryAmine
             | ReactiveSiteKind::NonTertiaryAmine
+            | ReactiveSiteKind::Phosphine
+            | ReactiveSiteKind::PhosphoniumSalt
+            | ReactiveSiteKind::PhosphorusYlide
+            | ReactiveSiteKind::SilylEther
+            | ReactiveSiteKind::Acetal
+            | ReactiveSiteKind::Ketal
+            | ReactiveSiteKind::BocCarbamate
+            | ReactiveSiteKind::CbzCarbamate
+            | ReactiveSiteKind::PhosphonateCarbanion
+            | ReactiveSiteKind::SulfoneCarbanion
             | ReactiveSiteKind::Isocyanate
             | ReactiveSiteKind::Borane
             | ReactiveSiteKind::BorateEster
             | ReactiveSiteKind::Alkene
             | ReactiveSiteKind::Alkyne
             | ReactiveSiteKind::ArylHalide
+            | ReactiveSiteKind::Enol
+            | ReactiveSiteKind::Enolate
     )
 }
 
@@ -323,9 +433,12 @@ fn generate_pair_reactions_for_seed(
             let acid_site = seed.clone().carboxylic_acid_site()?;
             for alcohol in space.sites_of(&ReactiveSiteKind::Alcohol) {
                 let alcohol_site = alcohol.alcohol_site()?;
-                if let Some(reaction) =
-                    generate_carboxylic_acid_esterification(&acid_site, &alcohol_site, resolver, context)?
-                {
+                if let Some(reaction) = generate_carboxylic_acid_esterification(
+                    &acid_site,
+                    &alcohol_site,
+                    resolver,
+                    context,
+                )? {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
@@ -334,9 +447,12 @@ fn generate_pair_reactions_for_seed(
             let alcohol_site = seed.clone().alcohol_site()?;
             for acid in space.sites_of(&ReactiveSiteKind::CarboxylicAcid) {
                 let acid_site = acid.carboxylic_acid_site()?;
-                if let Some(reaction) =
-                    generate_carboxylic_acid_esterification(&acid_site, &alcohol_site, resolver, context)?
-                {
+                if let Some(reaction) = generate_carboxylic_acid_esterification(
+                    &acid_site,
+                    &alcohol_site,
+                    resolver,
+                    context,
+                )? {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
@@ -352,8 +468,12 @@ fn generate_pair_reactions_for_seed(
             for carbonyl_kind in carbonyl_site_kinds() {
                 for carbonyl in space.sites_of(&carbonyl_kind) {
                     let carbonyl_site = carbonyl.carbonyl_site()?;
-                    let reaction =
-                        generate_acetal_formation(&carbonyl_site, &alcohol_site, resolver, context)?;
+                    let reaction = generate_acetal_formation(
+                        &carbonyl_site,
+                        &alcohol_site,
+                        resolver,
+                        context,
+                    )?;
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
@@ -377,11 +497,22 @@ fn generate_pair_reactions_for_seed(
         }
         ReactiveSiteKind::Halide => {
             let halide_site = seed.clone().halide_site()?;
+            for enol in space.sites_of(&ReactiveSiteKind::Enol) {
+                let center = enol.alpha_carbon_center()?;
+                if let Some(reaction) =
+                    generate_enolate_alkylation(&center, &halide_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
             for amine in space.sites_of(&ReactiveSiteKind::NonTertiaryAmine) {
                 let amine_site = amine.amine_site()?;
-                if let Some(reaction) =
-                    generate_halide_amine_substitution(&halide_site, &amine_site, resolver, context)?
-                {
+                if let Some(reaction) = generate_halide_amine_substitution(
+                    &halide_site,
+                    &amine_site,
+                    resolver,
+                    context,
+                )? {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
@@ -391,12 +522,59 @@ fn generate_pair_reactions_for_seed(
                 }
             }
         }
+        ReactiveSiteKind::Phosphine => {
+            let phosphine_site = seed.clone().phosphine_site()?;
+            for halide in space.sites_of(&ReactiveSiteKind::Halide) {
+                let halide_site = halide.halide_site()?;
+                if let Some(reaction) = generate_phosphonium_salt_formation(
+                    &halide_site,
+                    &phosphine_site,
+                    resolver,
+                    context,
+                )? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+        }
         ReactiveSiteKind::NonTertiaryAmine => {
             let amine_site = seed.clone().amine_site()?;
             for halide in space.sites_of(&ReactiveSiteKind::Halide) {
                 let halide_site = halide.halide_site()?;
+                if let Some(reaction) = generate_halide_amine_substitution(
+                    &halide_site,
+                    &amine_site,
+                    resolver,
+                    context,
+                )? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+            for carbonyl_kind in carbonyl_site_kinds() {
+                for carbonyl in space.sites_of(&carbonyl_kind) {
+                    let carbonyl_site = carbonyl.clone().carbonyl_site()?;
+                    for alpha in space
+                        .sites_of(&ReactiveSiteKind::Enol)
+                        .filter(|site| site.substance.id == carbonyl_site.participant.substance.id)
+                    {
+                        let alpha_center = alpha.alpha_carbon_center()?;
+                        if let Some(reaction) = generate_enamine_formation(
+                            &carbonyl_site,
+                            &amine_site,
+                            &alpha_center,
+                            resolver,
+                        )? {
+                            push_unique_reaction(reactions, reaction_ids, reaction)?;
+                        }
+                    }
+                }
+            }
+        }
+        ReactiveSiteKind::Ester => {
+            let ester_site = seed.clone().ester_site()?;
+            for enol in space.sites_of(&ReactiveSiteKind::Enol) {
+                let center = enol.alpha_carbon_center()?;
                 if let Some(reaction) =
-                    generate_halide_amine_substitution(&halide_site, &amine_site, resolver, context)?
+                    generate_claisen_condensation(&center, &ester_site, resolver)?
                 {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
@@ -406,13 +584,32 @@ fn generate_pair_reactions_for_seed(
             let carbonyl_site = seed.clone().carbonyl_site()?;
             for alcohol in space.sites_of(&ReactiveSiteKind::Alcohol) {
                 let alcohol_site = alcohol.alcohol_site()?;
-                let reaction = generate_acetal_formation(&carbonyl_site, &alcohol_site, resolver, context)?;
+                let reaction =
+                    generate_acetal_formation(&carbonyl_site, &alcohol_site, resolver, context)?;
                 push_unique_reaction(reactions, reaction_ids, reaction)?;
             }
             for amine in space.sites_of(&ReactiveSiteKind::PrimaryAmine) {
                 let amine_site = amine.amine_site()?;
-                let reaction = generate_imine_formation(&carbonyl_site, &amine_site, resolver, context)?;
+                let reaction =
+                    generate_imine_formation(&carbonyl_site, &amine_site, resolver, context)?;
                 push_unique_reaction(reactions, reaction_ids, reaction)?;
+            }
+            for alpha in space
+                .sites_of(&ReactiveSiteKind::Enol)
+                .filter(|site| site.substance.id == carbonyl_site.participant.substance.id)
+            {
+                let alpha_center = alpha.alpha_carbon_center()?;
+                for amine in space.sites_of(&ReactiveSiteKind::NonTertiaryAmine) {
+                    let amine_site = amine.amine_site()?;
+                    if let Some(reaction) = generate_enamine_formation(
+                        &carbonyl_site,
+                        &amine_site,
+                        &alpha_center,
+                        resolver,
+                    )? {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
             }
         }
         ReactiveSiteKind::PrimaryAmine => {
@@ -420,7 +617,8 @@ fn generate_pair_reactions_for_seed(
             for carbonyl_kind in carbonyl_site_kinds() {
                 for carbonyl in space.sites_of(&carbonyl_kind) {
                     let carbonyl_site = carbonyl.carbonyl_site()?;
-                    let reaction = generate_imine_formation(&carbonyl_site, &amine_site, resolver, context)?;
+                    let reaction =
+                        generate_imine_formation(&carbonyl_site, &amine_site, resolver, context)?;
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
@@ -501,6 +699,13 @@ fn generate_site_reactions_for_seed_participants<'a>(
                 }
             }
             ReactiveSiteKind::Enol => {
+                let center = seed.clone().alpha_carbon_center()?;
+                for reaction in generate_alpha_halogenation(&center, resolver)? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+                if let Some(reaction) = generate_aldol_dehydration(&center, resolver)? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
                 for carbonyl_kind in [
                     ReactiveSiteKind::Aldehyde,
                     ReactiveSiteKind::Ketone,
@@ -508,6 +713,41 @@ fn generate_site_reactions_for_seed_participants<'a>(
                 ] {
                     for carbonyl in space.sites_of(&carbonyl_kind) {
                         let reaction = generate_aldol_addition(seed.clone(), carbonyl, resolver)?;
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+                for halide in space.sites_of(&ReactiveSiteKind::Halide) {
+                    let halide_site = halide.halide_site()?;
+                    if let Some(reaction) =
+                        generate_enolate_alkylation(&center, &halide_site, resolver)?
+                    {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+                for alkene in space.sites_of(&ReactiveSiteKind::Alkene) {
+                    let alkene_site = alkene.unsaturated_bond_site()?;
+                    if let Some(reaction) =
+                        generate_michael_addition(&center, &alkene_site, resolver)?
+                    {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+                for ester in space.sites_of(&ReactiveSiteKind::Ester) {
+                    let ester_site = ester.ester_site()?;
+                    if let Some(reaction) =
+                        generate_claisen_condensation(&center, &ester_site, resolver)?
+                    {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+            }
+            ReactiveSiteKind::Ester => {
+                let ester_site = seed.clone().ester_site()?;
+                for enol in space.sites_of(&ReactiveSiteKind::Enol) {
+                    let center = enol.alpha_carbon_center()?;
+                    if let Some(reaction) =
+                        generate_claisen_condensation(&center, &ester_site, resolver)?
+                    {
                         push_unique_reaction(reactions, reaction_ids, reaction)?;
                     }
                 }
@@ -531,7 +771,9 @@ fn generate_site_reactions_for_seed_participants<'a>(
                 push_unique_reaction(reactions, reaction_ids, reaction)?;
             }
             ReactiveSiteKind::ArylHalide => {
-                if let Some(reaction) = generate_aryl_halide_hydroxide_substitution(seed.clone(), resolver)? {
+                if let Some(reaction) =
+                    generate_aryl_halide_hydroxide_substitution(seed.clone(), resolver)?
+                {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
                 if let Some(reaction) = generate_aryl_halide_ammonia_substitution(seed, resolver)? {

@@ -23,7 +23,17 @@ pub enum FunctionalGroupType {
     NonTertiaryAmine,
     NonTertiaryBorane,
     PrimaryAmine,
+    Phosphine,
+    PhosphonateCarbanion,
+    PhosphoniumSalt,
+    PhosphorusYlide,
+    SulfoneCarbanion,
     UnsubstitutedAmide,
+    SilylEther,
+    Acetal,
+    Ketal,
+    BocCarbamate,
+    CbzCarbamate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,7 +336,233 @@ pub fn find_functional_groups(structure: &MolecularStructure) -> Vec<FunctionalG
         }
     }
 
+    for phosphorus in 0..structure.atoms.len() {
+        if structure.atoms[phosphorus].element != "P" {
+            continue;
+        }
+        let hydrogens = bonded(structure, phosphorus, "H", Some(1.0));
+        let carbons = bonded(structure, phosphorus, "C", Some(1.0));
+        let double_oxygens = bonded(structure, phosphorus, "O", Some(2.0));
+        let positive = structure.atoms[phosphorus].charge > 0.1;
+        let negative_carbon = carbons
+            .iter()
+            .copied()
+            .find(|carbon| structure.atoms[*carbon].charge < -0.1);
+
+        if !positive && !double_oxygens.is_empty() {
+            if let Some(alpha_carbon) = negative_carbon {
+                let mut atoms = vec![phosphorus, alpha_carbon];
+                atoms.extend(double_oxygens.iter().copied());
+                atoms.extend(carbons.iter().copied().filter(|atom| *atom != alpha_carbon));
+                atoms.sort_unstable();
+                atoms.dedup();
+                groups.push(FunctionalGroup::new(
+                    FunctionalGroupType::PhosphonateCarbanion,
+                    atoms,
+                ));
+                continue;
+            }
+        }
+
+        if positive {
+            if let Some(alpha_carbon) = negative_carbon {
+                let mut atoms = vec![phosphorus, alpha_carbon];
+                atoms.extend(bonded(structure, alpha_carbon, "H", Some(1.0)));
+                atoms.extend(carbons.iter().copied().filter(|atom| *atom != alpha_carbon));
+                atoms.extend(hydrogens.iter().copied());
+                atoms.sort_unstable();
+                atoms.dedup();
+                groups.push(FunctionalGroup::new(FunctionalGroupType::PhosphorusYlide, atoms));
+                continue;
+            }
+            if let Some(alpha_carbon) = carbons
+                .iter()
+                .copied()
+                .find(|carbon| !bonded(structure, *carbon, "H", Some(1.0)).is_empty())
+            {
+                let mut atoms = vec![phosphorus, alpha_carbon];
+                atoms.extend(bonded(structure, alpha_carbon, "H", Some(1.0)));
+                atoms.extend(carbons.iter().copied().filter(|atom| *atom != alpha_carbon));
+                atoms.extend(hydrogens.iter().copied());
+                atoms.sort_unstable();
+                atoms.dedup();
+                groups.push(FunctionalGroup::new(FunctionalGroupType::PhosphoniumSalt, atoms));
+                continue;
+            }
+        }
+
+        if !positive
+            && structure.atoms[phosphorus].charge.abs() < 0.1
+            && hydrogens.is_empty()
+            && double_oxygens.is_empty()
+            && carbons.len() == 3
+        {
+            let mut atoms = vec![phosphorus];
+            atoms.extend(carbons.iter().copied());
+            atoms.sort_unstable();
+            atoms.dedup();
+            groups.push(FunctionalGroup::new(FunctionalGroupType::Phosphine, atoms));
+        }
+    }
+
+    // Add protecting group detection
+    add_protecting_groups(structure, &mut groups);
+
     groups
+}
+
+fn add_protecting_groups(structure: &MolecularStructure, groups: &mut Vec<FunctionalGroup>) {
+    // Detect silyl ethers: C-O-Si
+    for oxygen in 0..structure.atoms.len() {
+        if structure.atoms[oxygen].element != "O" {
+            continue;
+        }
+        let neighbors = structure.neighbors(oxygen);
+        let carbon_neighbors: Vec<usize> = neighbors
+            .iter()
+            .filter(|(atom, order)| {
+                structure.atoms[*atom].element == "C"
+                    && bond_order_matches(*order, 1.0)
+            })
+            .map(|(atom, _)| *atom)
+            .collect();
+        let silicon_neighbors: Vec<usize> = neighbors
+            .iter()
+            .filter(|(atom, order)| {
+                structure.atoms[*atom].element == "Si"
+                    && bond_order_matches(*order, 1.0)
+            })
+            .map(|(atom, _)| *atom)
+            .collect();
+        
+        if !carbon_neighbors.is_empty() && !silicon_neighbors.is_empty() {
+            // This is a silyl ether - the oxygen is bonded to both carbon and silicon
+            let mut atoms = vec![oxygen];
+            atoms.extend(carbon_neighbors.iter().copied());
+            atoms.extend(silicon_neighbors.iter().copied());
+            groups.push(FunctionalGroup::new(FunctionalGroupType::SilylEther, atoms));
+        }
+    }
+
+    for nitrogen in 0..structure.atoms.len() {
+        if structure.atoms[nitrogen].element != "N" {
+            continue;
+        }
+        for (carbonyl_carbon, n_bond) in structure.neighbors(nitrogen) {
+            if structure.atoms[carbonyl_carbon].element != "C"
+                || !bond_order_matches(n_bond, 1.0)
+            {
+                continue;
+            }
+            let carbonyl_oxygens = bonded(structure, carbonyl_carbon, "O", Some(2.0));
+            if carbonyl_oxygens.len() != 1 {
+                continue;
+            }
+            let alkoxy_oxygen = bonded(structure, carbonyl_carbon, "O", Some(1.0))
+                .into_iter()
+                .find(|oxygen| *oxygen != carbonyl_oxygens[0]);
+            let Some(alkoxy_oxygen) = alkoxy_oxygen else {
+                continue;
+            };
+            let Some(tert_butyl_carbon) = bonded(structure, alkoxy_oxygen, "C", Some(1.0))
+                .into_iter()
+                .find(|carbon| *carbon != carbonyl_carbon)
+            else {
+                continue;
+            };
+            let methyl_carbons = bonded(structure, tert_butyl_carbon, "C", Some(1.0));
+            if methyl_carbons.len() == 3 && methyl_carbons.iter().all(|methyl| {
+                bonded(structure, *methyl, "H", Some(1.0)).len() == 3
+                    && bonded(structure, *methyl, "C", Some(1.0)).len() == 1
+            }) {
+                let mut atoms = vec![
+                    nitrogen,
+                    carbonyl_carbon,
+                    carbonyl_oxygens[0],
+                    alkoxy_oxygen,
+                    tert_butyl_carbon,
+                ];
+                atoms.extend(methyl_carbons);
+                groups.push(FunctionalGroup::new(FunctionalGroupType::BocCarbamate, atoms));
+            }
+            let benzyl_carbons = bonded(structure, alkoxy_oxygen, "C", Some(1.0))
+                .into_iter()
+                .filter(|carbon| *carbon != carbonyl_carbon)
+                .collect::<Vec<_>>();
+            for benzyl_carbon in benzyl_carbons {
+                if bonded(structure, benzyl_carbon, "H", Some(1.0)).len() != 2 {
+                    continue;
+                }
+                let aromatic_carbons = structure
+                    .neighbors(benzyl_carbon)
+                    .into_iter()
+                    .filter_map(|(neighbor, order)| {
+                        (neighbor != alkoxy_oxygen
+                            && structure.atoms[neighbor].element == "C"
+                            && bond_order_matches(order, 1.0)
+                            && structure.neighbors(neighbor).into_iter().any(
+                                |(aromatic_neighbor, aromatic_order)| {
+                                    aromatic_neighbor != benzyl_carbon
+                                        && structure.atoms[aromatic_neighbor].element == "C"
+                                        && bond_order_matches(aromatic_order, 1.5)
+                                },
+                            ))
+                        .then_some(neighbor)
+                    })
+                    .collect::<Vec<_>>();
+                if aromatic_carbons.len() == 1 {
+                    groups.push(FunctionalGroup::new(
+                        FunctionalGroupType::CbzCarbamate,
+                        vec![
+                            nitrogen,
+                            carbonyl_carbon,
+                            carbonyl_oxygens[0],
+                            alkoxy_oxygen,
+                            benzyl_carbon,
+                            aromatic_carbons[0],
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+
+    for carbon in 0..structure.atoms.len() {
+        if structure.atoms[carbon].element != "C" {
+            continue;
+        }
+        let neighbors = structure.neighbors(carbon);
+        let ether_oxygens = neighbors
+            .iter()
+            .filter_map(|(atom, order)| {
+                (structure.atoms[*atom].element == "O"
+                    && bond_order_matches(*order, 1.0)
+                    && structure.hydrogen_count(*atom) == 0)
+                    .then_some(*atom)
+            })
+            .collect::<Vec<_>>();
+        if ether_oxygens.len() < 2 {
+            continue;
+        }
+        let carbon_neighbors = neighbors
+            .iter()
+            .filter(|(atom, order)| {
+                structure.atoms[*atom].element == "C" && bond_order_matches(*order, 1.0)
+            })
+            .count();
+        let hydrogen_count = structure.hydrogen_count(carbon);
+        let group_type = if hydrogen_count >= 1 {
+            FunctionalGroupType::Acetal
+        } else if carbon_neighbors >= 2 {
+            FunctionalGroupType::Ketal
+        } else {
+            continue;
+        };
+        groups.push(FunctionalGroup::new(
+            group_type,
+            vec![carbon, ether_oxygens[0], ether_oxygens[1]],
+        ));
+    }
 }
 
 fn bonded(

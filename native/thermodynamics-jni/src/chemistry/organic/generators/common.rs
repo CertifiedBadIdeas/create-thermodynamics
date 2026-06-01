@@ -86,33 +86,6 @@ pub(crate) fn carbonyl_atoms_from_site(
     })
 }
 
-pub(crate) fn enol_atoms(
-    structure: &MolecularStructure,
-    site: &ReactiveSite,
-) -> ChemistryResult<(usize, usize)> {
-    let (carbonyl, _) = carbonyl_atoms_from_site(structure, site, "enol")?;
-    let alpha = site
-        .atoms
-        .iter()
-        .copied()
-        .find(|atom| {
-            *atom != carbonyl
-                && structure.atoms[*atom].element == "C"
-                && structure
-                    .neighbors(carbonyl)
-                    .iter()
-                    .any(|(neighbor, order)| {
-                        *neighbor == *atom
-                            && crate::chemistry::molecule::bond_order_matches(*order, 1.0)
-                    })
-        })
-        .ok_or_else(|| ChemistryError::InvalidReaction {
-            reaction_id: "<generated-organic>".to_string(),
-            reason: "enol site does not contain an alpha carbon".to_string(),
-        })?;
-    Ok((carbonyl, alpha))
-}
-
 pub(crate) fn organometallic_atoms(
     structure: &MolecularStructure,
     site: &ReactiveSite,
@@ -170,7 +143,6 @@ pub(crate) fn atom_charge_sum(
     }
     Ok(charge.round() as i32)
 }
-
 
 pub(crate) fn first_bonded_hydrogen(structure: &MolecularStructure, atom: usize) -> Option<usize> {
     structure
@@ -287,9 +259,19 @@ pub(crate) fn site_kind_suffix(kind: &ReactiveSiteKind) -> &'static str {
         ReactiveSiteKind::Organomagnesium => "organomagnesium",
         ReactiveSiteKind::Phenol => "phenol",
         ReactiveSiteKind::PrimaryAmine => "primary_amine",
+        ReactiveSiteKind::Phosphine => "phosphine",
+        ReactiveSiteKind::PhosphonateCarbanion => "phosphonate_carbanion",
+        ReactiveSiteKind::PhosphoniumSalt => "phosphonium_salt",
+        ReactiveSiteKind::PhosphorusYlide => "phosphorus_ylide",
+        ReactiveSiteKind::SulfoneCarbanion => "sulfone_carbanion",
         ReactiveSiteKind::Sulfide => "sulfide",
         ReactiveSiteKind::SulfonylChloride => "sulfonyl_chloride",
         ReactiveSiteKind::Thiol => "thiol",
+        ReactiveSiteKind::SilylEther => "silyl_ether",
+        ReactiveSiteKind::Acetal => "acetal",
+        ReactiveSiteKind::Ketal => "ketal",
+        ReactiveSiteKind::BocCarbamate => "boc_carbamate",
+        ReactiveSiteKind::CbzCarbamate => "cbz_carbamate",
     }
 }
 

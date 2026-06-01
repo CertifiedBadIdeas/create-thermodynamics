@@ -100,7 +100,9 @@ impl MolecularStructure {
         super::frowns::canonical_structure_code(self)
     }
 
-    pub fn validate(&self) -> ChemistryResult<()> {
+    /// Structural integrity check: indices, elements, charges, connectivity.
+    /// Does NOT check valency — used as pre-validate before aromatize.
+    pub fn validate_structure(&self) -> ChemistryResult<()> {
         if self.atoms.is_empty() {
             return Err(invalid_structure(
                 &self.source_code,
@@ -143,13 +145,23 @@ impl MolecularStructure {
                 "structure is disconnected",
             ));
         }
-        let bond_orders = self.bond_orders_by_atom();
+        Ok(())
+    }
+
+    pub fn validate(&self) -> ChemistryResult<()> {
+        self.validate_structure()?;
+        let mut valency_orders = vec![0.0; self.atoms.len()];
+        for bond in &self.bonds {
+            let v = if bond_order_matches(bond.order, 1.5) { 1.0 } else { bond.order };
+            valency_orders[bond.from] += v;
+            valency_orders[bond.to] += v;
+        }
         for (index, atom) in self.atoms.iter().enumerate() {
             if atom.element == "R" {
                 continue;
             }
             let max_valency = max_valency(&atom.element);
-            if bond_orders[index] - atom.charge.abs() > max_valency + 1.0e-6 {
+            if valency_orders[index] - atom.charge.abs() > max_valency + 1.0e-6 {
                 return Err(invalid_structure(
                     &self.source_code,
                     &format!("atom {index} exceeds valency for {}", atom.element),
@@ -961,7 +973,7 @@ impl MolecularEditor {
     }
 
     pub fn finish(self) -> ChemistryResult<MolecularStructure> {
-        let structure = MolecularStructure {
+        let mut structure = MolecularStructure {
             source_code: if self.modified {
                 "generated".to_string()
             } else {
@@ -971,6 +983,8 @@ impl MolecularEditor {
             bonds: self.bonds,
             stereochemistry: self.stereochemistry,
         };
+        structure.validate()?;
+        structure = aromatize(structure)?;
         structure.validate()?;
         Ok(structure)
     }
@@ -1193,12 +1207,14 @@ impl StructureBuilder {
         if normalize_hydrogens {
             self.add_missing_hydrogens();
         }
-        let structure = MolecularStructure {
+        let mut structure = MolecularStructure {
             source_code: self.source_code,
             atoms: self.atoms,
             bonds: self.bonds,
             stereochemistry: self.stereochemistry,
         };
+        structure.validate()?;
+        structure = aromatize(structure)?;
         structure.validate()?;
         Ok(structure)
     }
@@ -1672,6 +1688,7 @@ fn next_lowest_valency(element: &str, bonds: f64) -> f64 {
         "Au" => &[0.0, 4.0],
         "Pb" => &[2.0, 4.0],
         "Ar" => &[0.0],
+        "Si" => &[4.0],
         _ => &[0.0],
     };
     valencies
@@ -1700,6 +1717,7 @@ fn max_valency(element: &str) -> f64 {
         "Au" => 4.0,
         "Pb" => 4.0,
         "Ar" => 0.0,
+        "Si" => 4.0,
         _ => 0.0,
     }
 }
@@ -1731,6 +1749,7 @@ pub fn element_mass(symbol: &str) -> ChemistryResult<f64> {
         "Br" => 79.90,
         "I" => 126.90,
         "Pt" => 195.08,
+        "Si" => 28.09,
         "Au" => 196.97,
         "Hg" => 200.59,
         "Pb" => 207.20,
@@ -1775,6 +1794,7 @@ pub fn legacy_element_symbol(name: &str) -> ChemistryResult<&'static str> {
         "MERCURY" => "Hg",
         "LEAD" => "Pb",
         "ARGON" => "Ar",
+        "SILICON" => "Si",
         _ => {
             return Err(ChemistryError::InvalidSubstance {
                 substance_id: "<java-structure>".to_string(),

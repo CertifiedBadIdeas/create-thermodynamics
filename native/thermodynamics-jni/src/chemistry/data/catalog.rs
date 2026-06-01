@@ -356,6 +356,9 @@ fn estimate_phase_properties(
     if tags.contains(&"solvent") {
         return SubstancePhaseProperties::organic_unlimited(0.1);
     }
+    if id == "trimethylphosphine" {
+        return SubstancePhaseProperties::organic_solute(0.0);
+    }
     if id.ends_with("_acid") || id.contains("acid") || id == "ammonia" {
         return SubstancePhaseProperties {
             preferred_liquid_phase: LiquidPhasePreference::Aqueous,
@@ -2065,6 +2068,19 @@ const DESTROY_SUBSTANCES: &[RawSubstance] = &[
         tags: &["acutely_toxic", "ozone_depleter", "smelly"],
     },
     RawSubstance {
+        id: "trimethylphosphine",
+        structure_code: Some(r#"destroy:linear:CP(C)C"#),
+        java_structure_code: None,
+        translation_key: Some("destroy.chemical.trimethylphosphine"),
+        boiling_point_celsius: Some(38.0),
+        boiling_point_kelvin: None,
+        density: Some(750.0),
+        molar_heat_capacity: Some(180.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["acutely_toxic", "smelly"],
+    },
+    RawSubstance {
         id: "phthalic_anhydride",
         structure_code: Some(r#"destroy:isohydrobenzofuran:,,,O,O,"#),
         java_structure_code: None,
@@ -2521,6 +2537,74 @@ const DESTROY_SUBSTANCES: &[RawSubstance] = &[
         color_argb: 0,
         tags: &[],
     },
+    // Protecting group reagents
+    // TMS-Cl: Me3SiCl - Si with 3 methyl groups and Cl
+    RawSubstance {
+        id: "trimethylsilyl_chloride",
+        structure_code: None,
+        java_structure_code: Some(r#"LegacyMolecularStructure.atom(LegacyElement.SILICON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.CHLORINE)"#),
+        translation_key: Some(r#"trimethylsilyl_chloride"#),
+        boiling_point_celsius: Some(57.0),
+        boiling_point_kelvin: None,
+        density: Some(856.0),
+        molar_heat_capacity: Some(150.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["smelly", "acutely_toxic"],
+    },
+    // TMS-F: Me3SiF - Si with 3 methyl groups and F
+    RawSubstance {
+        id: "trimethylsilyl_fluoride",
+        structure_code: None,
+        java_structure_code: Some(r#"LegacyMolecularStructure.atom(LegacyElement.SILICON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.CARBON).addAtom(LegacyElement.FLUORINE)"#),
+        translation_key: Some(r#"trimethylsilyl_fluoride"#),
+        boiling_point_celsius: Some(16.0),
+        boiling_point_kelvin: None,
+        density: Some(793.0),
+        molar_heat_capacity: Some(140.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["acutely_toxic"],
+    },
+    RawSubstance {
+        id: "di_tert_butyl_dicarbonate",
+        structure_code: Some(r#"destroy:linear:CC(C)(C)OC(=O)OC(=O)OC(C)(C)C"#),
+        java_structure_code: None,
+        translation_key: Some(r#"di_tert_butyl_dicarbonate"#),
+        boiling_point_celsius: Some(56.0),
+        boiling_point_kelvin: None,
+        density: Some(950.0),
+        molar_heat_capacity: Some(280.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["smelly"],
+    },
+    RawSubstance {
+        id: "benzyl_chloroformate",
+        structure_code: Some(r#"destroy:benzene:COC(=O)Cl,,,,,"#),
+        java_structure_code: None,
+        translation_key: Some(r#"benzyl_chloroformate"#),
+        boiling_point_celsius: Some(103.0),
+        boiling_point_kelvin: None,
+        density: Some(1212.0),
+        molar_heat_capacity: Some(200.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["acutely_toxic", "smelly"],
+    },
+    RawSubstance {
+        id: "tert_butanol",
+        structure_code: Some(r#"destroy:linear:CC(C)(C)O"#),
+        java_structure_code: None,
+        translation_key: Some(r#"tert_butanol"#),
+        boiling_point_celsius: Some(82.4),
+        boiling_point_kelvin: None,
+        density: Some(781.0),
+        molar_heat_capacity: Some(220.0),
+        specific_heat_capacity: None,
+        color_argb: 0,
+        tags: &["solvent"],
+    },
 ];
 
 #[cfg(test)]
@@ -2534,8 +2618,8 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(DESTROY_SUBSTANCE_COUNT, 159);
-        assert_eq!(registry.substance_count(), 162);
+        assert_eq!(DESTROY_SUBSTANCE_COUNT, 165);
+        assert_eq!(registry.substance_count(), 168);
     }
 
     #[test]
