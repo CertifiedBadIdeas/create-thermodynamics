@@ -6,12 +6,14 @@ use super::error::{ChemistryError, ChemistryResult};
 use super::kinetics::{channel_rate_sum_per_second, LightBand};
 use super::mixture::{Mixture, MixturePhase, TRACE_CONCENTRATION_MOL_PER_BUCKET};
 use super::reaction::Reaction;
-use super::redox::RedoxEnvironment;
+use super::redox::{evaluate_redox_potential, RedoxEnvironment};
 use super::registry::{
     ChemistryRegistry, IndexedReaction, ReactionCandidateScratch, SubstanceIndex,
 };
 use super::selectivity::{SelectivityContext, SelectivityEngine};
 use super::solution::equilibrate_solution_equilibria;
+use super::substance::SubstanceId;
+use super::thermodynamics::reaction_thermodynamic_rate_factor;
 
 pub const TICKS_PER_SECOND: f64 = 20.0;
 pub const EQUILIBRIUM_EPSILON_MOL_PER_BUCKET: f64 = TRACE_CONCENTRATION_MOL_PER_BUCKET;
@@ -21,6 +23,7 @@ pub struct SimulationReport {
     pub ticks: u32,
     pub reached_equilibrium: bool,
     pub reaction_results: BTreeMap<String, f64>,
+    pub external_products: BTreeMap<String, f64>,
     pub surfaces: BTreeMap<CatalystSurfaceId, CatalystSurfaceState>,
     pub surface_steps: BTreeMap<String, f64>,
 }
@@ -31,9 +34,18 @@ pub struct ReactionContext {
     pub light_power_by_band: BTreeMap<LightBand, f64>,
     pub external_reactants: BTreeMap<String, f64>,
     pub external_catalysts: BTreeMap<String, f64>,
+    pub external_products: BTreeMap<String, f64>,
+    pub gas_atmosphere: Option<GasAtmosphere>,
     pub surfaces: BTreeMap<CatalystSurfaceId, CatalystSurfaceState>,
     pub reaction_results: BTreeMap<String, f64>,
     pub surface_steps: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GasAtmosphere {
+    pub mole_fractions: Vec<(SubstanceId, f64)>,
+    pub total_pressure_pascal: f64,
+    pub exchange_coefficient_per_tick: f64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -51,6 +63,7 @@ impl ReactionApplication {
 #[derive(Debug, Clone)]
 struct ContextCheckpoint {
     external_reactants: Vec<(String, Option<f64>)>,
+    external_products: Vec<(String, Option<f64>)>,
     surfaces: Vec<(CatalystSurfaceId, Option<CatalystSurfaceState>)>,
     reaction_results: Vec<(String, Option<f64>)>,
     surface_steps: Vec<(String, Option<f64>)>,
@@ -63,6 +76,8 @@ impl Default for ReactionContext {
             light_power_by_band: BTreeMap::new(),
             external_reactants: BTreeMap::new(),
             external_catalysts: BTreeMap::new(),
+            external_products: BTreeMap::new(),
+            gas_atmosphere: None,
             surfaces: BTreeMap::new(),
             reaction_results: BTreeMap::new(),
             surface_steps: BTreeMap::new(),
@@ -120,6 +135,64 @@ impl ReactionContext {
         }
     }
 
+    pub fn with_open_atmosphere(
+        mut self,
+        mole_fractions: impl IntoIterator<Item = (SubstanceId, f64)>,
+        total_pressure_pascal: f64,
+        exchange_coefficient_per_tick: f64,
+    ) -> ChemistryResult<Self> {
+        self.set_open_atmosphere(
+            mole_fractions,
+            total_pressure_pascal,
+            exchange_coefficient_per_tick,
+        )?;
+        Ok(self)
+    }
+
+    pub fn set_open_atmosphere(
+        &mut self,
+        mole_fractions: impl IntoIterator<Item = (SubstanceId, f64)>,
+        total_pressure_pascal: f64,
+        exchange_coefficient_per_tick: f64,
+    ) -> ChemistryResult<()> {
+        if !total_pressure_pascal.is_finite() || total_pressure_pascal < 0.0 {
+            return Err(ChemistryError::InvalidMixtureState(
+                "atmosphere pressure must be non-negative and finite".to_string(),
+            ));
+        }
+        if !exchange_coefficient_per_tick.is_finite() || exchange_coefficient_per_tick < 0.0 {
+            return Err(ChemistryError::InvalidMixtureState(
+                "gas exchange coefficient must be non-negative and finite".to_string(),
+            ));
+        }
+        let mut fractions = Vec::new();
+        let mut fraction_sum = 0.0;
+        for (substance_id, fraction) in mole_fractions {
+            if !fraction.is_finite() || fraction < 0.0 {
+                return Err(ChemistryError::InvalidMixtureState(
+                    "atmosphere gas fraction must be non-negative and finite".to_string(),
+                ));
+            }
+            fraction_sum += fraction;
+            fractions.push((substance_id, fraction));
+        }
+        if fraction_sum > 1.0 + 1.0e-12 {
+            return Err(ChemistryError::InvalidMixtureState(
+                "atmosphere gas fractions must not sum above one".to_string(),
+            ));
+        }
+        self.gas_atmosphere = Some(GasAtmosphere {
+            mole_fractions: fractions,
+            total_pressure_pascal,
+            exchange_coefficient_per_tick,
+        });
+        Ok(())
+    }
+
+    pub fn close_gas_boundary(&mut self) {
+        self.gas_atmosphere = None;
+    }
+
     pub fn add_external_reactant(
         &mut self,
         description: impl Into<String>,
@@ -139,7 +212,7 @@ impl ReactionContext {
             description.clone(),
             moles_per_bucket,
         )?;
-        self.add_surface(description, moles_per_bucket)
+        self.add_surface_sites(description, moles_per_bucket)
     }
 
     pub fn add_surface(
@@ -150,6 +223,31 @@ impl ReactionContext {
         let surface_id = surface_id.into();
         let state = CatalystSurfaceState::new(sites_mol_per_bucket)?;
         self.surfaces.insert(surface_id, state);
+        Ok(())
+    }
+
+    pub fn add_surface_sites(
+        &mut self,
+        surface_id: impl Into<CatalystSurfaceId>,
+        sites_mol_per_bucket: f64,
+    ) -> ChemistryResult<()> {
+        if !sites_mol_per_bucket.is_finite() || sites_mol_per_bucket < 0.0 {
+            return Err(ChemistryError::InvalidMixtureState(
+                "surface site amount must be non-negative and finite".to_string(),
+            ));
+        }
+        let surface_id = surface_id.into();
+        if let Some(state) = self.surfaces.get_mut(&surface_id) {
+            state.total_sites_mol_per_bucket += sites_mol_per_bucket;
+            if !state.total_sites_mol_per_bucket.is_finite() {
+                return Err(ChemistryError::InvalidMixtureState(
+                    "surface site amount must remain finite".to_string(),
+                ));
+            }
+        } else {
+            let state = CatalystSurfaceState::new(sites_mol_per_bucket)?;
+            self.surfaces.insert(surface_id, state);
+        }
         Ok(())
     }
 
@@ -200,9 +298,25 @@ pub fn react_for_tick_with_context(
     let mut candidate_scratch = ReactionCandidateScratch::new();
     let mut reactions_with_rates = Vec::new();
     for _ in 0..cycles {
+        if let Some(atmosphere) = &context.gas_atmosphere {
+            let gas_exchange_delta = mixture.exchange_gases_with_atmosphere(
+                registry,
+                &atmosphere.mole_fractions,
+                atmosphere.total_pressure_pascal,
+                atmosphere.exchange_coefficient_per_tick,
+                1.0 / cycles as f64,
+            )?;
+            if gas_exchange_delta > EQUILIBRIUM_EPSILON_MOL_PER_BUCKET {
+                any_changed = true;
+            }
+        }
         let gas_transfer_delta =
             mixture.transfer_gases_toward_solubility_equilibrium(registry, 1.0 / cycles as f64)?;
         if gas_transfer_delta > EQUILIBRIUM_EPSILON_MOL_PER_BUCKET {
+            any_changed = true;
+        }
+        let initial_equilibrium_delta = equilibrate_solution_equilibria(registry, mixture)?;
+        if initial_equilibrium_delta > EQUILIBRIUM_EPSILON_MOL_PER_BUCKET {
             any_changed = true;
         }
         registry.collect_reaction_candidate_indices_for_substance_indices(
@@ -299,6 +413,7 @@ pub fn react_until_equilibrium_with_context(
                 ticks: tick + 1,
                 reached_equilibrium: true,
                 reaction_results: context.reaction_results.clone(),
+                external_products: context.external_products.clone(),
                 surfaces: context.surfaces.clone(),
                 surface_steps: context.surface_steps.clone(),
             });
@@ -308,6 +423,7 @@ pub fn react_until_equilibrium_with_context(
         ticks: max_ticks,
         reached_equilibrium: false,
         reaction_results: context.reaction_results.clone(),
+        external_products: context.external_products.clone(),
         surfaces: context.surfaces.clone(),
         surface_steps: context.surface_steps.clone(),
     })
@@ -340,6 +456,8 @@ pub fn reaction_rate_mol_per_bucket_per_tick_with_context(
     if !redox_environment_allows_reaction(registry, mixture, reaction)? {
         return Ok(0.0);
     }
+    rate *= reaction_thermodynamic_rate_factor(registry, mixture, reaction)?;
+    rate *= redox_thermodynamic_rate_factor(registry, mixture, reaction)?;
     let condition_evaluation =
         evaluate_reaction_conditions(registry, mixture, &reaction.conditions)?;
     if !condition_evaluation.allowed {
@@ -397,6 +515,8 @@ fn reaction_rate_mol_per_bucket_per_tick_for_indexed_reaction(
     if !redox_environment_allows_reaction(registry, mixture, reaction)? {
         return Ok(0.0);
     }
+    rate *= reaction_thermodynamic_rate_factor(registry, mixture, reaction)?;
+    rate *= redox_thermodynamic_rate_factor(registry, mixture, reaction)?;
     let condition_evaluation =
         evaluate_reaction_conditions(registry, mixture, &reaction.conditions)?;
     if !condition_evaluation.allowed {
@@ -490,6 +610,16 @@ fn channel_context_can_exist(
         }
         super::kinetics::ChannelConditionEffect::Phase { .. } => true,
     })
+}
+
+fn redox_thermodynamic_rate_factor(
+    registry: &ChemistryRegistry,
+    mixture: &Mixture,
+    reaction: &Reaction,
+) -> ChemistryResult<f64> {
+    Ok(evaluate_redox_potential(registry, mixture, reaction)?
+        .map(|evaluation| evaluation.thermodynamic_rate_factor)
+        .unwrap_or(1.0))
 }
 
 fn redox_environment_allows_reaction(
@@ -698,6 +828,7 @@ fn apply_reaction_inner(
         moles_per_bucket,
     )?;
     apply_external_reactants(context, reaction, moles_per_bucket)?;
+    apply_external_products(context, reaction, moles_per_bucket);
     apply_surface_steps(context, reaction, moles_per_bucket)?;
     apply_reaction_results(context, reaction, moles_per_bucket);
     mixture.heat(
@@ -947,6 +1078,19 @@ fn apply_reaction_results(
     }
 }
 
+fn apply_external_products(
+    context: &mut ReactionContext,
+    reaction: &Reaction,
+    moles_per_bucket: f64,
+) {
+    for product in &reaction.external_products {
+        *context
+            .external_products
+            .entry(product.description.clone())
+            .or_insert(0.0) += product.moles_per_reaction * moles_per_bucket;
+    }
+}
+
 fn add_delta(deltas: &mut Vec<(SubstanceIndex, f64)>, substance: SubstanceIndex, delta: f64) {
     if let Some((_, existing)) = deltas
         .iter_mut()
@@ -1030,6 +1174,19 @@ fn checkpoint_context(context: &ReactionContext, reaction: &Reaction) -> Context
                 )
             })
             .collect(),
+        external_products: reaction
+            .external_products
+            .iter()
+            .map(|external| {
+                (
+                    external.description.clone(),
+                    context
+                        .external_products
+                        .get(&external.description)
+                        .copied(),
+                )
+            })
+            .collect(),
         surfaces: reaction
             .surface_requirements
             .iter()
@@ -1075,6 +1232,16 @@ fn restore_context(context: &mut ReactionContext, checkpoint: ContextCheckpoint)
             }
             None => {
                 context.external_reactants.remove(&description);
+            }
+        }
+    }
+    for (description, previous) in checkpoint.external_products {
+        match previous {
+            Some(value) => {
+                context.external_products.insert(description, value);
+            }
+            None => {
+                context.external_products.remove(&description);
             }
         }
     }
@@ -1142,9 +1309,11 @@ fn add_external(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chemistry::condition::{AcidityCondition, ReactionCondition};
     use crate::chemistry::registry::ChemistryRegistryBuilder;
+    use crate::chemistry::solution::{AcidBaseSpec, EquilibriumSpec};
     use crate::chemistry::substance::{
-        LiquidPhasePreference, SolventRole, Substance, SubstancePhaseProperties,
+        LiquidPhasePreference, SolventRole, Substance, SubstanceId, SubstancePhaseProperties,
     };
 
     fn simple_registry(reaction: Reaction) -> ChemistryRegistry {
@@ -1209,6 +1378,73 @@ mod tests {
                 500.0,
                 100.0,
                 20_000.0,
+            ))
+            .reaction(reaction)
+            .build()
+            .unwrap()
+    }
+
+    fn acid_condition_registry(reaction: Reaction) -> ChemistryRegistry {
+        let aqueous = SubstancePhaseProperties::aqueous_unlimited();
+        ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 18_000.0, 373.0, 75.0, 40_650.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(
+                Substance::new("destroy:proton", 1, 1.0, 1_000.0, f64::MAX, 100.0, 20_000.0)
+                    .with_phase_properties(aqueous.clone()),
+            )
+            .substance(
+                Substance::new(
+                    "destroy:hydroxide",
+                    -1,
+                    17.0,
+                    1_000.0,
+                    f64::MAX,
+                    100.0,
+                    20_000.0,
+                )
+                .with_phase_properties(aqueous.clone()),
+            )
+            .substance(
+                Substance::new("destroy:acid", 0, 11.0, 10_000.0, 500.0, 100.0, 20_000.0)
+                    .with_phase_properties(aqueous.clone()),
+            )
+            .substance(
+                Substance::new("destroy:base", -1, 10.0, 10_000.0, 500.0, 100.0, 20_000.0)
+                    .with_phase_properties(aqueous.clone()),
+            )
+            .substance(
+                Substance::new("destroy:a", 0, 10.0, 10_000.0, 500.0, 100.0, 20_000.0)
+                    .with_phase_properties(aqueous.clone()),
+            )
+            .substance(
+                Substance::new("destroy:b", 0, 10.0, 10_000.0, 500.0, 100.0, 20_000.0)
+                    .with_phase_properties(aqueous),
+            )
+            .equilibrium(EquilibriumSpec::new(
+                "destroy:water.autoionization",
+                [(SubstanceId::from("destroy:water"), 1, MixturePhase::Aqueous)],
+                [
+                    (
+                        SubstanceId::from("destroy:proton"),
+                        1,
+                        MixturePhase::Aqueous,
+                    ),
+                    (
+                        SubstanceId::from("destroy:hydroxide"),
+                        1,
+                        MixturePhase::Aqueous,
+                    ),
+                ],
+                1.0e-14,
+            ))
+            .acid_base_pair(AcidBaseSpec::new(
+                "destroy:acid",
+                "destroy:acid",
+                "destroy:base",
+                4.0,
             ))
             .reaction(reaction)
             .build()
@@ -1306,6 +1542,34 @@ mod tests {
 
         assert!(changed);
         assert!(mixture.temperature_kelvin() > 298.0);
+    }
+
+    #[test]
+    fn acid_base_equilibrium_is_applied_before_conditioned_reactions() {
+        let registry = acid_condition_registry(
+            Reaction::builder("destroy:acidic_a_to_b")
+                .reactant("destroy:a", 1, 1)
+                .product("destroy:b", 1)
+                .condition(
+                    ReactionCondition::new("acid required").acidity(AcidityCondition::Acidic),
+                )
+                .pre_exponential_factor(1.0e12)
+                .activation_energy_kj_per_mol(0.0)
+                .build(),
+        );
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        mixture
+            .add_substance(&registry, "destroy:acid", 0.1)
+            .unwrap();
+        mixture.add_substance(&registry, "destroy:a", 0.1).unwrap();
+
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+
+        assert!(mixture.ph(&registry).unwrap().unwrap() < 6.0);
+        assert!(mixture.concentration_of(&"destroy:b".into()) > 0.0);
     }
 
     #[test]

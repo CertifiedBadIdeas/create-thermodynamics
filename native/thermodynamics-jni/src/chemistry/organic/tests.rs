@@ -40,6 +40,7 @@ const ACTIVE_DESTROY_GENERIC_REACTIONS: &[&str] = &[
     "amine_phosgenation",
     "borane_oxidation",
     "borate_ester_hydrolysis",
+    "borohydride_carbonyl_reduction",
     "cyanamide_addition",
     "carboxylic_acid_esterification",
     "cyanide_nucleophilic_addition",
@@ -48,6 +49,7 @@ const ACTIVE_DESTROY_GENERIC_REACTIONS: &[&str] = &[
     "halide_cyanide_substitution",
     "halide_hydroxide_substitution",
     "isocyanate_hydrolysis",
+    "lah_ester_reduction",
     "nitrile_hydrogenation",
     "nitrile_hydrolysis",
     "nitro_hydrogenation",
@@ -58,7 +60,6 @@ const ACTIVE_DESTROY_GENERIC_REACTIONS: &[&str] = &[
 const EXCLUDED_DESTROY_GENERIC_REACTIONS: &[&str] = &[
     "electrophilic_hydroboration",
     "borate_esterification",
-    "borohydride_carbonyl_reduction",
     "carboxylic_acid_reduction",
 ];
 
@@ -382,8 +383,8 @@ fn generated_registry_builds_without_duplicate_derived_substances() {
 
 #[test]
 fn active_destroy_generic_reactions_are_accounted_for() {
-    assert_eq!(ACTIVE_DESTROY_GENERIC_REACTIONS.len(), 40);
-    assert_eq!(EXCLUDED_DESTROY_GENERIC_REACTIONS.len(), 4);
+    assert_eq!(ACTIVE_DESTROY_GENERIC_REACTIONS.len(), 42);
+    assert_eq!(EXCLUDED_DESTROY_GENERIC_REACTIONS.len(), 3);
 
     let registry = generated_registry();
     for prefix in ACTIVE_DESTROY_GENERIC_REACTIONS {
@@ -448,6 +449,76 @@ fn alcohol_oxidation_generates_acetone_from_isopropanol() {
         .products
         .iter()
         .any(|term| term.substance_id.as_str() == "destroy:acetone"));
+}
+
+#[test]
+fn borohydride_reduces_carbonyls_to_alcohols_with_closed_boron_stoichiometry() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    dynamic
+        .generate_reactions_for_substances([SubstanceId::from("destroy:acetone")], 1)
+        .unwrap();
+    let registry = dynamic.to_registry().unwrap();
+    let reaction = reaction_for_reactants(
+        &registry,
+        "borohydride_carbonyl_reduction",
+        &[SubstanceId::from("destroy:acetone")],
+    )
+    .expect("acetone must generate borohydride reduction");
+    assert!(reaction
+        .reactants
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:borohydride"));
+    assert!(reaction
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:isopropanol"));
+    assert!(reaction
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:tetrahydroxyborate"));
+}
+
+#[test]
+fn lah_ester_reduction_splits_ester_into_two_alcohols() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let acid = SubstanceId::from("destroy:acetic_acid");
+    let ethanol = SubstanceId::from("destroy:ethanol");
+    dynamic
+        .generate_reactions_for_substances([acid.clone(), ethanol.clone()], 1)
+        .unwrap();
+    let registry = dynamic.to_registry().unwrap();
+    let esterification = reaction_for_reactants(
+        &registry,
+        "carboxylic_acid_esterification",
+        &[acid, ethanol],
+    )
+    .expect("acetic acid and ethanol must generate ethyl acetate");
+    let ester = esterification
+        .products
+        .iter()
+        .find(|term| term.substance_id.as_str() != "destroy:water")
+        .expect("esterification must have an ester product")
+        .substance_id
+        .clone();
+
+    dynamic
+        .generate_reactions_for_substances([ester.clone()], 1)
+        .unwrap();
+    let registry = dynamic.to_registry().unwrap();
+    let reduction = reaction_for_reactants(&registry, "lah_ester_reduction", &[ester])
+        .expect("ester must generate LAH reduction");
+    assert!(reduction.external_reactants.iter().any(|external| {
+        external.description == "lithium aluminium hydride hydride/proton equivalents"
+    }));
+    let ethanol_count = reduction
+        .products
+        .iter()
+        .filter(|term| term.substance_id.as_str() == "destroy:ethanol")
+        .map(|term| term.coefficient)
+        .sum::<u32>();
+    assert_eq!(ethanol_count, 2);
 }
 
 #[test]
@@ -635,7 +706,12 @@ fn phosphorus_generators_are_registered() {
 
     let salt = dynamic
         .reactions()
-        .find(|reaction| reaction.id.as_str().starts_with("phosphonium_salt_formation/"))
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("phosphonium_salt_formation/")
+        })
         .expect("phosphonium salt formation must be registered");
     assert!(salt
         .products
@@ -653,7 +729,9 @@ fn phosphorus_generators_are_registered() {
         .generate_reactions_for_substances([salt_product.clone(), ethoxide.clone()], 1)
         .expect("ylide path must generate");
 
-    let registry = dynamic.to_registry().expect("dynamic registry must convert");
+    let registry = dynamic
+        .to_registry()
+        .expect("dynamic registry must convert");
     let ylide = reaction_for_reactants(
         &registry,
         "phosphonium_ylide_formation",
@@ -675,7 +753,9 @@ fn phosphorus_generators_are_registered() {
     dynamic
         .generate_reactions_for_substances([ylide_product.clone(), acetone.clone()], 1)
         .expect("wittig path must generate");
-    let registry = dynamic.to_registry().expect("dynamic registry must convert");
+    let registry = dynamic
+        .to_registry()
+        .expect("dynamic registry must convert");
     let wittig = reaction_for_reactants(
         &registry,
         "wittig_olefination",
@@ -707,7 +787,9 @@ fn hwe_and_julia_olefinations_use_concrete_anionic_reagents() {
             1,
         )
         .expect("olefination generators must run");
-    let registry = dynamic.to_registry().expect("dynamic registry must convert");
+    let registry = dynamic
+        .to_registry()
+        .expect("dynamic registry must convert");
 
     let hwe = reaction_for_reactants(
         &registry,
@@ -844,7 +926,9 @@ fn alcohol_acyl_protection_uses_regular_ester_chemistry() {
     dynamic
         .generate_reactions_for_substances([ethanol.clone(), acetyl_chloride.clone()], 1)
         .expect("acetyl chloride and ethanol must generate esterification");
-    let registry = dynamic.to_registry().expect("dynamic registry must convert");
+    let registry = dynamic
+        .to_registry()
+        .expect("dynamic registry must convert");
     let esterification = reaction_for_reactants(
         &registry,
         "acyl_chloride_esterification",
@@ -882,7 +966,9 @@ fn alcohol_acyl_protection_uses_regular_ester_chemistry() {
     dynamic
         .generate_reactions_for_substances([ester.clone()], 1)
         .expect("ester product must generate hydrolysis");
-    let registry = dynamic.to_registry().expect("dynamic registry must convert");
+    let registry = dynamic
+        .to_registry()
+        .expect("dynamic registry must convert");
     let hydrolysis = reaction_for_reactants(&registry, "ester_hydrolysis", &[ester])
         .expect("acyl-protected alcohol must deprotect through ester hydrolysis");
     assert!(
@@ -916,7 +1002,9 @@ fn carboxylic_acid_protection_uses_concrete_ester_products() {
         dynamic
             .generate_reactions_for_substances([acid.clone(), alcohol.clone()], 1)
             .expect("carboxylic acid and alcohol must generate ester protection");
-        let registry = dynamic.to_registry().expect("dynamic registry must convert");
+        let registry = dynamic
+            .to_registry()
+            .expect("dynamic registry must convert");
         let esterification = reaction_for_reactants(
             &registry,
             "carboxylic_acid_esterification",
@@ -955,7 +1043,9 @@ fn carboxylic_acid_protection_uses_concrete_ester_products() {
         dynamic
             .generate_reactions_for_substances([ester.clone()], 1)
             .expect("acid-protecting ester must generate hydrolysis");
-        let registry = dynamic.to_registry().expect("dynamic registry must convert");
+        let registry = dynamic
+            .to_registry()
+            .expect("dynamic registry must convert");
         let hydrolysis = reaction_for_reactants(&registry, "ester_hydrolysis", &[ester])
             .expect("protected acid must deprotect through ester hydrolysis");
         assert!(
@@ -1253,7 +1343,10 @@ fn tms_protection_creates_protected_ether_without_free_alcohol_site() {
                 .id
                 .as_str()
                 .starts_with("alcohol_silyl_protection/")
-                && reaction.reactants.iter().any(|term| term.substance_id == ethanol)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == ethanol)
         })
         .expect("ethanol must generate TMS protection");
     assert!(protection
@@ -1307,7 +1400,10 @@ fn tms_deprotection_restores_original_alcohol() {
                 .id
                 .as_str()
                 .starts_with("alcohol_silyl_protection/")
-                && reaction.reactants.iter().any(|term| term.substance_id == ethanol)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == ethanol)
         })
         .unwrap()
         .products
@@ -1366,10 +1462,7 @@ fn acetal_hydrolysis_restores_carbonyl_and_concrete_alcohols() {
     let acetal_reaction = dynamic
         .reactions()
         .find(|reaction| {
-            reaction
-                .id
-                .as_str()
-                .starts_with("acetal_formation/")
+            reaction.id.as_str().starts_with("acetal_formation/")
                 && reaction
                     .reactants
                     .iter()
@@ -1410,10 +1503,7 @@ fn acetal_hydrolysis_restores_carbonyl_and_concrete_alcohols() {
     let hydrolysis = dynamic
         .reactions()
         .find(|reaction| {
-            reaction
-                .id
-                .as_str()
-                .starts_with("acetal_deprotection/")
+            reaction.id.as_str().starts_with("acetal_deprotection/")
                 && reaction
                     .reactants
                     .iter()

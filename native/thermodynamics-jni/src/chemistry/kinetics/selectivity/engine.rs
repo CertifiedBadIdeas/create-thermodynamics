@@ -7,6 +7,7 @@ use super::elimination::{evaluate_e1, evaluate_e2};
 use super::esterification::evaluate_fischer_esterification;
 use super::nucleophilic_substitution::evaluate_sn2;
 use super::types::*;
+use crate::chemistry::mixture::TRACE_CONCENTRATION_MOL_PER_BUCKET;
 use crate::chemistry::molecule::{bond_order_matches, MolecularStructure};
 use crate::chemistry::reactive_site::ReactiveSiteKind;
 
@@ -31,13 +32,48 @@ impl SelectivityEngine {
                 };
                 evaluate_fischer_esterification(&profile.primary_site, alcohol, context).primary
             }
-            ReactionType::CarbonylAddition => evaluate_carbonyl_addition(
-                &profile.primary_site,
-                profile
+            ReactionType::CarbonylAddition => {
+                let nucleophile_strength = profile
                     .nucleophile_strength
-                    .unwrap_or(NucleophileStrength::Moderate),
-                context,
-            ),
+                    .unwrap_or(NucleophileStrength::Moderate);
+                let mut score = evaluate_carbonyl_addition(
+                    &profile.primary_site,
+                    nucleophile_strength,
+                    context,
+                );
+                apply_inorganic_environment_to_carbonyl_score(
+                    &mut score,
+                    nucleophile_strength,
+                    context,
+                );
+                score
+            }
+            ReactionType::CarbonylReduction => {
+                let mut score = evaluate_carbonyl_addition(
+                    &profile.primary_site,
+                    profile
+                        .nucleophile_strength
+                        .unwrap_or(NucleophileStrength::Strong),
+                    context,
+                );
+                if context.is_acidic() {
+                    score.value *= 0.2;
+                    score.activation_delta += 8.0;
+                    score.reason = format!(
+                        "hydride is quenched in strongly acidic medium; {}",
+                        score.reason
+                    );
+                } else if context.is_oxidizing() {
+                    let redox_penalty = redox_competition_penalty(context);
+                    score.value *= redox_penalty;
+                    score.activation_delta += 6.0 + (1.0 - redox_penalty) * 8.0;
+                    score.reason =
+                        format!("oxidizing medium competes with reduction; {}", score.reason);
+                } else {
+                    score.reason = format!("hydride carbonyl reduction: {}", score.reason);
+                }
+                score
+            }
             ReactionType::WittigOlefination
             | ReactionType::HornerWadsworthEmmonsOlefination
             | ReactionType::JuliaOlefination => {
@@ -217,6 +253,50 @@ impl SelectivityEngine {
     pub fn pre_exponential_multiplier(score: &ReactivityScore) -> f64 {
         score.pre_exp_multiplier
     }
+}
+
+fn apply_inorganic_environment_to_carbonyl_score(
+    score: &mut ReactivityScore,
+    nucleophile_strength: NucleophileStrength,
+    context: &SelectivityContext,
+) {
+    if nucleophile_strength != NucleophileStrength::VeryStrong {
+        return;
+    }
+    let mut reasons = Vec::new();
+    if context.is_water_rich() {
+        score.value *= 0.02;
+        score.activation_delta += 24.0;
+        reasons.push("water quenches strongly basic organometallic nucleophiles");
+    } else if context.water_activity > 0.02 {
+        score.value *= 0.2;
+        score.activation_delta += 10.0;
+        reasons.push("trace water competes with organometallic addition");
+    }
+    if context.is_oxygen_rich() || context.is_oxidizing() {
+        score.value *= 0.25;
+        score.activation_delta += 8.0;
+        reasons.push("oxidizing medium consumes strongly reducing organometallic reagent");
+    }
+    if context.has_free_complexable_metal() {
+        let metal_penalty =
+            (1.0 / (1.0 + context.free_complexable_metal_activity * 20.0)).clamp(0.05, 1.0);
+        score.value *= metal_penalty;
+        score.activation_delta += (1.0 - metal_penalty) * 12.0;
+        reasons.push("free metal ions coordinate or quench the organometallic reagent");
+    }
+    if !reasons.is_empty() {
+        score.reason = format!("{}; {}", score.reason, reasons.join("; "));
+    }
+}
+
+fn redox_competition_penalty(context: &SelectivityContext) -> f64 {
+    let total = context.oxidizing_strength + context.reducing_strength;
+    if total <= TRACE_CONCENTRATION_MOL_PER_BUCKET {
+        return 1.0;
+    }
+    let oxidizing_fraction = context.oxidizing_strength / total;
+    (1.0 - oxidizing_fraction * 0.9).clamp(0.05, 1.0)
 }
 
 /// Builder for creating site descriptors from molecular analysis
@@ -557,10 +637,7 @@ impl SiteDescriptorBuilder {
             site.participant.structure,
             ReactiveSiteKind::PhosphoniumSalt,
             site.alpha_carbon,
-            site
-                .participant
-                .structure
-                .carbon_degree(site.alpha_carbon),
+            site.participant.structure.carbon_degree(site.alpha_carbon),
         )
     }
 
@@ -571,10 +648,7 @@ impl SiteDescriptorBuilder {
             site.participant.structure,
             ReactiveSiteKind::PhosphorusYlide,
             site.alpha_carbon,
-            site
-                .participant
-                .structure
-                .carbon_degree(site.alpha_carbon),
+            site.participant.structure.carbon_degree(site.alpha_carbon),
         )
     }
 
@@ -585,10 +659,7 @@ impl SiteDescriptorBuilder {
             site.participant.structure,
             ReactiveSiteKind::PhosphonateCarbanion,
             site.alpha_carbon,
-            site
-                .participant
-                .structure
-                .carbon_degree(site.alpha_carbon),
+            site.participant.structure.carbon_degree(site.alpha_carbon),
         );
         descriptor.electronics.electron_withdrawing_groups += 1;
         descriptor.electronics.resonance_stabilization = true;
@@ -602,10 +673,7 @@ impl SiteDescriptorBuilder {
             site.participant.structure,
             ReactiveSiteKind::SulfoneCarbanion,
             site.alpha_carbon,
-            site
-                .participant
-                .structure
-                .carbon_degree(site.alpha_carbon),
+            site.participant.structure.carbon_degree(site.alpha_carbon),
         );
         descriptor.electronics.electron_withdrawing_groups += 2;
         descriptor.electronics.resonance_stabilization = true;
@@ -664,6 +732,11 @@ fn evaluate_alpha_carbon_profile(
             } else {
                 value *= 0.35;
                 activation_delta += 10.0;
+            }
+            if context.is_water_rich() {
+                value *= 0.65;
+                activation_delta += 2.0;
+                reason.push_str("; water competes with enolate chemistry");
             }
         }
         ReactionType::AldolDehydration => {
@@ -800,8 +873,9 @@ fn evaluate_protecting_group_profile(
         }
         ReactionType::CarbamateCleavage => {
             let acid_path = context.is_acidic() && context.is_water_rich();
-            let hydrogenolysis_path =
-                context.has_hydrogen() && context.palladium_available;
+            let hydrogenolysis_path = context.has_hydrogen()
+                && context.palladium_available
+                && context.has_available_surface();
             if acid_path {
                 value *= 2.5;
                 activation_delta -= 7.0;
@@ -815,7 +889,8 @@ fn evaluate_protecting_group_profile(
             if !acid_path && !hydrogenolysis_path {
                 value *= 0.03;
                 activation_delta += 24.0;
-                reasons.push("carbamate cleavage lacks acid hydrolysis or hydrogenolysis conditions");
+                reasons
+                    .push("carbamate cleavage lacks acid hydrolysis or hydrogenolysis conditions");
             }
         }
         ReactionType::EsterProtection => {
@@ -857,11 +932,8 @@ fn evaluate_protecting_group_profile(
         _ => {}
     }
 
-    ReactivityScore::with_activation_delta(
-        activation_delta,
-        reasons.join("; "),
-    )
-    .with_pre_exp_multiplier(value.max(0.01))
+    ReactivityScore::with_activation_delta(activation_delta, reasons.join("; "))
+        .with_pre_exp_multiplier(value.max(0.01))
 }
 
 fn descriptor_from_carbon(
@@ -1101,6 +1173,36 @@ mod tests {
     }
 
     #[test]
+    fn strongly_basic_carbonyl_addition_uses_inorganic_mixture_state() {
+        let profile = SelectivityProfile::new(
+            ReactionType::CarbonylAddition,
+            SiteDescriptorBuilder::ketone(),
+        )
+        .with_nucleophile_strength(NucleophileStrength::VeryStrong)
+        .never_suppress();
+        let dry = SelectivityContext {
+            water_activity: 0.0,
+            oxygen_activity: 0.0,
+            oxidizing_strength: 0.0,
+            free_complexable_metal_activity: 0.0,
+            ..Default::default()
+        };
+        let wet_metal_oxidizing = SelectivityContext {
+            water_activity: 0.8,
+            oxygen_activity: 0.2,
+            oxidizing_strength: 0.3,
+            free_complexable_metal_activity: 0.05,
+            ..Default::default()
+        };
+
+        let dry_effect = SelectivityEngine::evaluate_profile(&profile, &dry);
+        let wet_effect = SelectivityEngine::evaluate_profile(&profile, &wet_metal_oxidizing);
+
+        assert!(dry_effect.rate_multiplier > wet_effect.rate_multiplier);
+        assert!(dry_effect.activation_delta_kj_per_mol < wet_effect.activation_delta_kj_per_mol);
+    }
+
+    #[test]
     fn protecting_group_profiles_respond_to_water_acid_and_fluoride() {
         let silylation = SelectivityProfile::new(
             ReactionType::SilylEtherFormation,
@@ -1129,7 +1231,8 @@ mod tests {
             SiteDescriptorBuilder::silyl_ether(),
         )
         .never_suppress();
-        let no_fluoride = SelectivityEngine::evaluate_profile(&cleavage, &SelectivityContext::default());
+        let no_fluoride =
+            SelectivityEngine::evaluate_profile(&cleavage, &SelectivityContext::default());
         let with_fluoride = SelectivityEngine::evaluate_profile(
             &cleavage,
             &SelectivityContext {
@@ -1140,8 +1243,7 @@ mod tests {
         );
         assert!(with_fluoride.rate_multiplier > no_fluoride.rate_multiplier);
         assert!(
-            with_fluoride.activation_delta_kj_per_mol
-                < no_fluoride.activation_delta_kj_per_mol
+            with_fluoride.activation_delta_kj_per_mol < no_fluoride.activation_delta_kj_per_mol
         );
     }
 
@@ -1167,6 +1269,7 @@ mod tests {
             &SelectivityContext {
                 hydrogen_mol_per_bucket: 0.5,
                 palladium_available: true,
+                available_surface_sites_mol_per_bucket: 0.1,
                 ..Default::default()
             },
         );

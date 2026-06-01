@@ -7,12 +7,16 @@ use super::kinetics::{ChannelConditionEffect, ReactionChannel};
 use super::mixture::MixturePhase;
 use super::reaction::{ProductDistribution, Reaction, ReactionId, StoichiometricTerm};
 use super::redox::{
-    validate_half_reaction_conservation, validate_half_reaction_shape, validate_redox_annotation,
-    validate_redox_pair, RedoxHalfReaction, RedoxPair,
+    build_redox_pair_reaction, validate_half_reaction_conservation, validate_half_reaction_shape,
+    validate_redox_annotation, validate_redox_pair, RedoxHalfReaction, RedoxPair, RedoxPairSpec,
 };
-use super::solution::{AcidBaseSpec, EquilibriumSpec, IndexedEquilibrium, IndexedEquilibriumTerm};
+use super::solution::{
+    AcidBaseSpec, EquilibriumSpec, IndexedEquilibrium, IndexedEquilibriumTerm,
+    IndexedPrecipitation, PrecipitationSpec,
+};
 use super::substance::{
-    SolventRole, Substance, SubstanceAggregateState, SubstanceId, SubstanceTagId,
+    MaterialFormulaUnit, SolventRole, Substance, SubstanceAggregateState, SubstanceId,
+    SubstanceRepresentation, SubstanceTagId,
 };
 
 const MASS_TOLERANCE_GRAMS_PER_MOL: f64 = 1.0e-6;
@@ -135,6 +139,7 @@ pub struct ChemistryRegistry {
     gas_solubility: BTreeMap<SubstanceIndex, GasSolubilityModel>,
     acid_base_specs: Vec<AcidBaseSpec>,
     indexed_equilibria: Vec<IndexedEquilibrium>,
+    indexed_precipitations: Vec<IndexedPrecipitation>,
     redox_half_reactions: BTreeMap<String, RedoxHalfReaction>,
     catalyst_surface_specs: BTreeMap<CatalystSurfaceId, CatalystSurfaceSpec>,
     complex_specs: Vec<ComplexSpec>,
@@ -284,8 +289,16 @@ impl ChemistryRegistry {
         &self.indexed_equilibria
     }
 
+    pub(crate) fn indexed_precipitations(&self) -> &[IndexedPrecipitation] {
+        &self.indexed_precipitations
+    }
+
     pub fn redox_half_reactions(&self) -> impl Iterator<Item = &RedoxHalfReaction> {
         self.redox_half_reactions.values()
+    }
+
+    pub fn redox_half_reaction(&self, id: &str) -> Option<&RedoxHalfReaction> {
+        self.redox_half_reactions.get(id)
     }
 
     pub fn catalyst_surface_spec(&self, id: &CatalystSurfaceId) -> Option<&CatalystSurfaceSpec> {
@@ -310,8 +323,10 @@ pub struct ChemistryRegistryBuilder {
     gas_solubility: Vec<(SubstanceId, GasSolubilityModel)>,
     acid_base_specs: Vec<AcidBaseSpec>,
     equilibria: Vec<EquilibriumSpec>,
+    precipitations: Vec<PrecipitationSpec>,
     redox_half_reactions: Vec<RedoxHalfReaction>,
     redox_pairs: Vec<RedoxPair>,
+    redox_pair_specs: Vec<RedoxPairSpec>,
     catalyst_surface_specs: Vec<CatalystSurfaceSpec>,
     complex_specs: Vec<ComplexSpec>,
 }
@@ -359,12 +374,22 @@ impl ChemistryRegistryBuilder {
                 .filter(|equilibrium| {
                     !equilibrium.spec.id.ends_with(".acid_base_equilibrium")
                         && !equilibrium.spec.id.ends_with(".neutralization_equilibrium")
+                        && !equilibrium
+                            .spec
+                            .id
+                            .ends_with(".base_hydrolysis_equilibrium")
                         && !complex_equilibrium_ids.contains(&equilibrium.spec.id)
                 })
                 .map(|equilibrium| equilibrium.spec.clone())
                 .collect(),
+            precipitations: registry
+                .indexed_precipitations
+                .iter()
+                .map(|precipitation| precipitation.spec.clone())
+                .collect(),
             redox_half_reactions: registry.redox_half_reactions.values().cloned().collect(),
             redox_pairs: Vec::new(),
+            redox_pair_specs: Vec::new(),
             catalyst_surface_specs: registry.catalyst_surface_specs.values().cloned().collect(),
             complex_specs: registry.complex_specs.clone(),
         }
@@ -415,6 +440,11 @@ impl ChemistryRegistryBuilder {
         self
     }
 
+    pub fn precipitation(mut self, spec: PrecipitationSpec) -> Self {
+        self.precipitations.push(spec);
+        self
+    }
+
     pub fn redox_half_reaction(mut self, half_reaction: RedoxHalfReaction) -> Self {
         self.redox_half_reactions.push(half_reaction);
         self
@@ -422,6 +452,20 @@ impl ChemistryRegistryBuilder {
 
     pub fn redox_pair(mut self, pair: RedoxPair) -> Self {
         self.redox_pairs.push(pair);
+        self
+    }
+
+    pub fn redox_pair_from_halves(
+        mut self,
+        reaction_id: impl Into<ReactionId>,
+        oxidation_half_id: impl Into<String>,
+        reduction_half_id: impl Into<String>,
+    ) -> Self {
+        self.redox_pair_specs.push(RedoxPairSpec::new(
+            reaction_id,
+            oxidation_half_id,
+            reduction_half_id,
+        ));
         self
     }
 
@@ -449,6 +493,9 @@ impl ChemistryRegistryBuilder {
         for pair in self.redox_pairs {
             validate_redox_pair(&pair, &redox_half_reactions)?;
             reactions.push(pair.reaction);
+        }
+        for spec in self.redox_pair_specs {
+            reactions.push(build_redox_pair_reaction(&spec, &redox_half_reactions)?);
         }
         let mut substances = self.substances;
         let mut equilibria = self.equilibria;
@@ -521,6 +568,11 @@ impl ChemistryRegistryBuilder {
         }
         let indexed_equilibria =
             build_indexed_equilibria(&equilibria, &substances_by_index, &substance_id_to_index)?;
+        let indexed_precipitations = build_indexed_precipitations(
+            &self.precipitations,
+            &substances_by_index,
+            &substance_id_to_index,
+        )?;
         let registry = ChemistryRegistry {
             substances_by_index,
             substance_id_to_index,
@@ -535,12 +587,14 @@ impl ChemistryRegistryBuilder {
             gas_solubility,
             acid_base_specs,
             indexed_equilibria,
+            indexed_precipitations,
             redox_half_reactions,
             catalyst_surface_specs,
             complex_specs: complex_specs.into_iter().map(|(spec, _)| spec).collect(),
         };
         registry.validate_redox_half_reactions()?;
         registry.validate_substance_tags()?;
+        registry.validate_material_representations()?;
         registry.validate_reactions()?;
         Ok(registry)
     }
@@ -557,6 +611,65 @@ impl ChemistryRegistry {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_material_representations(&self) -> ChemistryResult<()> {
+        for substance in &self.substances_by_index {
+            match &substance.representation {
+                SubstanceRepresentation::IonicSolid { formula_units }
+                | SubstanceRepresentation::Oxide { formula_units } => {
+                    self.validate_material_formula(substance, formula_units, &[])?;
+                }
+                SubstanceRepresentation::Hydrate {
+                    formula_units,
+                    water_count,
+                } => {
+                    let water = SubstanceId::from("destroy:water");
+                    let hydrate_water = [MaterialFormulaUnit::new(water, *water_count)];
+                    self.validate_material_formula(substance, formula_units, &hydrate_water)?;
+                }
+                SubstanceRepresentation::Molecular
+                | SubstanceRepresentation::Ion { .. }
+                | SubstanceRepresentation::Metal { .. }
+                | SubstanceRepresentation::SurfaceMaterial { .. }
+                | SubstanceRepresentation::UnspecifiedMaterial { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_material_formula(
+        &self,
+        material: &Substance,
+        formula_units: &[MaterialFormulaUnit],
+        extra_units: &[MaterialFormulaUnit],
+    ) -> ChemistryResult<()> {
+        let mut mass = 0.0;
+        let mut charge = 0;
+        for unit in formula_units.iter().chain(extra_units.iter()) {
+            let component = self.substance(&unit.substance_id)?;
+            mass += component.molar_mass_grams * unit.coefficient as f64;
+            charge += component.charge * unit.coefficient as i32;
+        }
+        if charge != material.charge {
+            return Err(ChemistryError::InvalidSubstance {
+                substance_id: material.id.to_string(),
+                reason: format!(
+                    "material formula charge {charge} does not match substance charge {}",
+                    material.charge
+                ),
+            });
+        }
+        if (mass - material.molar_mass_grams).abs() > MASS_TOLERANCE_GRAMS_PER_MOL {
+            return Err(ChemistryError::InvalidSubstance {
+                substance_id: material.id.to_string(),
+                reason: format!(
+                    "material formula mass {mass} does not match substance mass {}",
+                    material.molar_mass_grams
+                ),
+            });
         }
         Ok(())
     }
@@ -692,9 +805,9 @@ impl ChemistryRegistry {
                 .filter_map(|requirement| {
                     requirement
                         .charge
-                        .map(|charge| charge * requirement.moles_per_reaction.round() as i32)
+                        .map(|charge| charge as f64 * requirement.moles_per_reaction)
                 })
-                .sum::<i32>();
+                .sum::<f64>();
 
             let reactant_charge = reaction
                 .reactants
@@ -702,31 +815,22 @@ impl ChemistryRegistry {
                 .map(|term| {
                     self.substance_index(&term.substance_id)
                         .map(|index| {
-                            self.substance_properties.charge[index.0] * term.coefficient as i32
+                            self.substance_properties.charge[index.0] as f64
+                                * term.coefficient as f64
                         })
                         .ok_or_else(|| ChemistryError::UnknownSubstance {
                             reaction_id: reaction.id.to_string(),
                             substance_id: term.substance_id.to_string(),
                         })
                 })
-                .sum::<ChemistryResult<i32>>()?
+                .sum::<ChemistryResult<f64>>()?
                 + external_reactant_charge;
-            let external_product_charge = reaction
-                .external_products
-                .iter()
-                .filter_map(|requirement| {
-                    requirement
-                        .charge
-                        .map(|charge| charge * requirement.moles_per_reaction.round() as i32)
-                })
-                .sum::<i32>();
-            let product_charge = product_charge(reaction, self)? + external_product_charge as f64;
-            if (reactant_charge as f64 - product_charge).abs() > 1.0e-9
-                && !reaction.allow_charge_imbalance
+            let product_charge = product_charge(reaction, self)?;
+            if (reactant_charge - product_charge).abs() > 1.0e-9 && !reaction.allow_charge_imbalance
             {
                 return Err(ChemistryError::ChargeNotConserved {
                     reaction_id: reaction.id.to_string(),
-                    reactants: reactant_charge,
+                    reactants: reactant_charge.round() as i32,
                     products: product_charge.round() as i32,
                 });
             }
@@ -749,16 +853,7 @@ impl ChemistryRegistry {
                 })
                 .sum::<ChemistryResult<f64>>()?
                 + external_reactant_mass;
-            let external_product_mass = reaction
-                .external_products
-                .iter()
-                .filter_map(|requirement| {
-                    requirement
-                        .molar_mass_grams
-                        .map(|mass| mass * requirement.moles_per_reaction)
-                })
-                .sum::<f64>();
-            let product_mass = product_mass(reaction, self)? + external_product_mass;
+            let product_mass = product_mass(reaction, self)?;
             if (reactant_mass - product_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
                 && !reaction.allow_mass_imbalance
             {
@@ -805,6 +900,41 @@ impl ChemistryRegistry {
                         reverse_id: reverse_id.to_string(),
                         reason: "enthalpy changes must sum to zero".to_string(),
                     });
+                }
+                match (&reaction.thermodynamics, &reverse.thermodynamics) {
+                    (Some(forward), Some(backward)) => {
+                        if (forward.reference_temperature_kelvin
+                            - backward.reference_temperature_kelvin)
+                            .abs()
+                            > THERMO_TOLERANCE
+                        {
+                            return Err(ChemistryError::ReversibleThermodynamicsMismatch {
+                                reaction_id: reaction.id.to_string(),
+                                reverse_id: reverse_id.to_string(),
+                                reason: "thermodynamic reference temperatures must match"
+                                    .to_string(),
+                            });
+                        }
+                        if (forward.gibbs_free_energy_change_kj_per_mol
+                            + backward.gibbs_free_energy_change_kj_per_mol)
+                            .abs()
+                            > THERMO_TOLERANCE
+                        {
+                            return Err(ChemistryError::ReversibleThermodynamicsMismatch {
+                                reaction_id: reaction.id.to_string(),
+                                reverse_id: reverse_id.to_string(),
+                                reason: "Gibbs free energy changes must sum to zero".to_string(),
+                            });
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(ChemistryError::ReversibleThermodynamicsMismatch {
+                            reaction_id: reaction.id.to_string(),
+                            reverse_id: reverse_id.to_string(),
+                            reason: "paired reverse reactions must either both define thermodynamics or both omit it".to_string(),
+                        });
+                    }
                 }
                 let expected_reverse_activation =
                     reaction.activation_energy_kj_per_mol - reaction.enthalpy_change_kj_per_mol;
@@ -913,7 +1043,7 @@ fn product_charge(reaction: &Reaction, registry: &ChemistryRegistry) -> Chemistr
                 .sum::<ChemistryResult<f64>>()?
                 + external_product_charge;
             if first_channel_charge.is_none() {
-                first_channel_charge = Some(channel_charge - external_product_charge);
+                first_channel_charge = Some(channel_charge);
             }
             if (reactant_charge - channel_charge).abs() > 1.0e-9 && !reaction.allow_charge_imbalance
             {
@@ -1030,7 +1160,7 @@ fn product_mass(reaction: &Reaction, registry: &ChemistryRegistry) -> ChemistryR
                 .sum::<ChemistryResult<f64>>()?
                 + external_product_mass;
             if first_channel_mass.is_none() {
-                first_channel_mass = Some(channel_mass - external_product_mass);
+                first_channel_mass = Some(channel_mass);
             }
             if (reactant_mass - channel_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL
                 && !reaction.allow_mass_imbalance
@@ -1154,6 +1284,12 @@ fn build_complex_specs(
                 substance_id: spec.central_ion.to_string(),
             }
         })?;
+        if central.charge == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: format!("{}.formation", spec.id),
+                reason: "complex central substance must be an ion with explicit charge".to_string(),
+            });
+        }
         let mut charge = central.charge;
         let mut mass = central.molar_mass_grams;
         for ligand in &spec.ligands {
@@ -1163,6 +1299,28 @@ fn build_complex_specs(
                     substance_id: ligand.substance_id.to_string(),
                 }
             })?;
+            let ligand_solubility = match spec.phase {
+                MixturePhase::Aqueous => {
+                    ligand_substance
+                        .phase_properties
+                        .aqueous_solubility_mol_per_bucket
+                }
+                MixturePhase::Organic => {
+                    ligand_substance
+                        .phase_properties
+                        .organic_solubility_mol_per_bucket
+                }
+                MixturePhase::Gas | MixturePhase::Solid => None,
+            };
+            if ligand_substance.phase_properties.can_precipitate && ligand_solubility == Some(0.0) {
+                return Err(ChemistryError::InvalidReaction {
+                    reaction_id: format!("{}.formation", spec.id),
+                    reason: format!(
+                        "complex ligand '{}' is not available as a dissolved ligand",
+                        ligand.substance_id
+                    ),
+                });
+            }
             charge += ligand_substance.charge * ligand.count as i32;
             mass += ligand_substance.molar_mass_grams * ligand.count as f64;
         }
@@ -1386,6 +1544,125 @@ fn build_indexed_equilibria(
         });
     }
     Ok(result)
+}
+
+fn build_indexed_precipitations(
+    specs: &[PrecipitationSpec],
+    substances: &[Substance],
+    substance_id_to_index: &BTreeMap<SubstanceId, SubstanceIndex>,
+) -> ChemistryResult<Vec<IndexedPrecipitation>> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for spec in specs {
+        validate_precipitation_spec_shape(spec)?;
+        if !seen.insert(spec.id.clone()) {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "duplicate precipitation spec".to_string(),
+            });
+        }
+        let solid = *substance_id_to_index.get(&spec.solid).ok_or_else(|| {
+            ChemistryError::UnknownSubstance {
+                reaction_id: spec.id.clone(),
+                substance_id: spec.solid.to_string(),
+            }
+        })?;
+        if !substances[solid.0].phase_properties.can_precipitate {
+            return Err(ChemistryError::InvalidSubstance {
+                substance_id: spec.solid.to_string(),
+                reason: "precipitation solid must be allowed to precipitate".to_string(),
+            });
+        }
+        let ions = index_equilibrium_terms(&spec.id, &spec.ions, substance_id_to_index)?;
+        validate_precipitation_conservation(spec, substances, solid, &ions)?;
+        result.push(IndexedPrecipitation {
+            spec: spec.clone(),
+            solid,
+            ions,
+        });
+    }
+    Ok(result)
+}
+
+fn validate_precipitation_spec_shape(spec: &PrecipitationSpec) -> ChemistryResult<()> {
+    if spec.id.trim().is_empty() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: "<precipitation>".to_string(),
+            reason: "precipitation id must not be empty".to_string(),
+        });
+    }
+    if spec.ions.is_empty() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "precipitation must have dissolved ions".to_string(),
+        });
+    }
+    if !spec.solubility_product.is_finite() || spec.solubility_product <= 0.0 {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "solubility product must be positive and finite".to_string(),
+        });
+    }
+    if !spec.reference_temperature_kelvin.is_finite() || spec.reference_temperature_kelvin <= 0.0 {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "precipitation reference temperature must be positive and finite".to_string(),
+        });
+    }
+    if !spec.enthalpy_change_kj_per_mol.is_finite() {
+        return Err(ChemistryError::InvalidReaction {
+            reaction_id: spec.id.clone(),
+            reason: "precipitation enthalpy change must be finite".to_string(),
+        });
+    }
+    for term in &spec.ions {
+        if term.coefficient == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "precipitation coefficients must be greater than zero".to_string(),
+            });
+        }
+        if term.phase != MixturePhase::Aqueous {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: spec.id.clone(),
+                reason: "precipitation ions must be aqueous".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_precipitation_conservation(
+    spec: &PrecipitationSpec,
+    substances: &[Substance],
+    solid: SubstanceIndex,
+    ions: &[IndexedEquilibriumTerm],
+) -> ChemistryResult<()> {
+    let ion_charge = ions
+        .iter()
+        .map(|term| substances[term.substance.0].charge * term.coefficient as i32)
+        .sum::<i32>();
+    let solid_charge = substances[solid.0].charge;
+    if solid_charge != ion_charge {
+        return Err(ChemistryError::ChargeNotConserved {
+            reaction_id: spec.id.clone(),
+            reactants: solid_charge,
+            products: ion_charge,
+        });
+    }
+    let ion_mass = ions
+        .iter()
+        .map(|term| substances[term.substance.0].molar_mass_grams * term.coefficient as f64)
+        .sum::<f64>();
+    let solid_mass = substances[solid.0].molar_mass_grams;
+    if (solid_mass - ion_mass).abs() > MASS_TOLERANCE_GRAMS_PER_MOL {
+        return Err(ChemistryError::MassNotConserved {
+            reaction_id: spec.id.clone(),
+            reactants: solid_mass,
+            products: ion_mass,
+        });
+    }
+    Ok(())
 }
 
 fn validate_equilibrium_spec_shape(spec: &EquilibriumSpec) -> ChemistryResult<()> {
@@ -1735,5 +2012,60 @@ fn mark_reaction_candidate(scratch: &mut ReactionCandidateScratch, reaction_inde
             *slot = scratch.generation;
             scratch.candidates.push(reaction_index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chemistry::substance::{LiquidPhasePreference, SubstancePhaseProperties};
+
+    fn aqueous_ion(id: &str, charge: i32, mass: f64) -> Substance {
+        Substance::new(id, charge, mass, 1000.0, f64::MAX, 50.0, 0.0).with_phase_properties(
+            SubstancePhaseProperties {
+                preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+                aqueous_solubility_mol_per_bucket: Some(10.0),
+                organic_solubility_mol_per_bucket: Some(0.0),
+                can_precipitate: false,
+                can_form_liquid_phase: false,
+                solvent_role: SolventRole::NotSolvent,
+            },
+        )
+    }
+
+    #[test]
+    fn material_formula_mass_and_charge_are_checked_by_registry() {
+        let bad_salt = Substance::new(
+            "destroy:bad_sodium_chloride",
+            0,
+            100.0,
+            2_160_000.0,
+            f64::MAX,
+            50.0,
+            0.0,
+        )
+        .with_phase_properties(SubstancePhaseProperties {
+            preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+            aqueous_solubility_mol_per_bucket: Some(0.01),
+            organic_solubility_mol_per_bucket: Some(0.0),
+            can_precipitate: true,
+            can_form_liquid_phase: false,
+            solvent_role: SolventRole::NotSolvent,
+        })
+        .with_representation(SubstanceRepresentation::IonicSolid {
+            formula_units: vec![
+                MaterialFormulaUnit::new("destroy:sodium_ion", 1),
+                MaterialFormulaUnit::new("destroy:chloride", 1),
+            ],
+        });
+
+        let error = ChemistryRegistryBuilder::new()
+            .substance(aqueous_ion("destroy:sodium_ion", 1, 22.99))
+            .substance(aqueous_ion("destroy:chloride", -1, 35.45))
+            .substance(bad_salt)
+            .build()
+            .unwrap_err();
+
+        assert!(matches!(error, ChemistryError::InvalidSubstance { .. }));
     }
 }

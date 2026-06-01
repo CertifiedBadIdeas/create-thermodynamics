@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 
 use crate::chemistry::error::ChemistryResult;
-use crate::chemistry::mixture::{Mixture, MixturePhase, TRACE_CONCENTRATION_MOL_PER_BUCKET};
+use crate::chemistry::mixture::{
+    Mixture, MixturePhase, STANDARD_PRESSURE_PASCAL, TRACE_CONCENTRATION_MOL_PER_BUCKET,
+};
+use crate::chemistry::redox::RedoxRole;
 use crate::chemistry::registry::ChemistryRegistry;
 use crate::chemistry::simulation::ReactionContext;
 use crate::chemistry::substance::{LiquidPhasePreference, SolventRole, SubstanceId};
@@ -121,6 +124,17 @@ pub struct SelectivityContext {
     pub water_activity: f64,
     pub fluoride_mol_per_bucket: f64,
     pub hydrogen_mol_per_bucket: f64,
+    pub hydrogen_partial_pressure_pascal: f64,
+    pub oxygen_activity: f64,
+    pub oxygen_partial_pressure_pascal: f64,
+    pub total_gas_pressure_pascal: f64,
+    pub uv_power: f64,
+    pub total_light_power: f64,
+    pub oxidizing_strength: f64,
+    pub reducing_strength: f64,
+    pub free_complexable_metal_activity: f64,
+    pub complexed_metal_mol_per_bucket: f64,
+    pub available_surface_sites_mol_per_bucket: f64,
     pub palladium_available: bool,
 }
 
@@ -133,6 +147,17 @@ impl Default for SelectivityContext {
             water_activity: 0.0,
             fluoride_mol_per_bucket: 0.0,
             hydrogen_mol_per_bucket: 0.0,
+            hydrogen_partial_pressure_pascal: 0.0,
+            oxygen_activity: 0.0,
+            oxygen_partial_pressure_pascal: 0.0,
+            total_gas_pressure_pascal: 0.0,
+            uv_power: 0.0,
+            total_light_power: 0.0,
+            oxidizing_strength: 0.0,
+            reducing_strength: 0.0,
+            free_complexable_metal_activity: 0.0,
+            complexed_metal_mol_per_bucket: 0.0,
+            available_surface_sites_mol_per_bucket: 0.0,
             palladium_available: false,
         }
     }
@@ -150,12 +175,12 @@ impl SelectivityContext {
     ) -> ChemistryResult<Self> {
         let ph = mixture.ph(registry)?;
         let water = SubstanceId::from("destroy:water");
-        let water_activity = registry
-            .substance(&water)
-            .ok()
-            .map(|_| mixture.activity_of(registry, &water, MixturePhase::Aqueous))
-            .transpose()?
-            .unwrap_or(0.0);
+        let water_activity = max_known_activity(
+            registry,
+            mixture,
+            &water,
+            &[MixturePhase::Aqueous, MixturePhase::Organic],
+        )?;
         let fluoride = SubstanceId::from("destroy:fluoride");
         let fluoride_mol_per_bucket = registry
             .substance(&fluoride)
@@ -168,18 +193,51 @@ impl SelectivityContext {
             .ok()
             .map(|_| mixture.concentration_of(&hydrogen))
             .unwrap_or(0.0);
-        let palladium_available = reaction_context.external_catalysts.iter().any(
-            |(description, amount)| {
-                *amount > TRACE_CONCENTRATION_MOL_PER_BUCKET
-                    && description.to_ascii_lowercase().contains("palladium")
-            },
-        ) || reaction_context
+        let hydrogen_partial_pressure_pascal = known_partial_pressure(registry, mixture, &hydrogen);
+        let oxygen = SubstanceId::from("destroy:oxygen");
+        let oxygen_activity = max_known_activity(
+            registry,
+            mixture,
+            &oxygen,
+            &[
+                MixturePhase::Aqueous,
+                MixturePhase::Organic,
+                MixturePhase::Gas,
+            ],
+        )?;
+        let oxygen_partial_pressure_pascal = known_partial_pressure(registry, mixture, &oxygen);
+        let (oxidizing_strength, reducing_strength) = redox_role_strengths(registry, mixture)?;
+        let (free_complexable_metal_activity, complexed_metal_mol_per_bucket) =
+            metal_availability(registry, mixture)?;
+        let total_light_power = reaction_context
+            .light_power_by_band
+            .values()
+            .copied()
+            .sum::<f64>()
+            .max(reaction_context.uv_power);
+        let available_surface_sites_mol_per_bucket = reaction_context
             .surfaces
-            .iter()
-            .any(|(surface_id, surface)| {
-                surface.free_sites() > TRACE_CONCENTRATION_MOL_PER_BUCKET
-                    && surface_id.as_str().to_ascii_lowercase().contains("palladium")
-            });
+            .values()
+            .map(|surface| surface.free_sites())
+            .sum::<f64>();
+        let palladium_available =
+            reaction_context
+                .external_catalysts
+                .iter()
+                .any(|(description, amount)| {
+                    *amount > TRACE_CONCENTRATION_MOL_PER_BUCKET
+                        && description.to_ascii_lowercase().contains("palladium")
+                })
+                || reaction_context
+                    .surfaces
+                    .iter()
+                    .any(|(surface_id, surface)| {
+                        surface.free_sites() > TRACE_CONCENTRATION_MOL_PER_BUCKET
+                            && surface_id
+                                .as_str()
+                                .to_ascii_lowercase()
+                                .contains("palladium")
+                    });
         let mut context = Self {
             temperature: mixture.temperature_kelvin(),
             ph,
@@ -187,6 +245,17 @@ impl SelectivityContext {
             water_activity,
             fluoride_mol_per_bucket,
             hydrogen_mol_per_bucket,
+            hydrogen_partial_pressure_pascal,
+            oxygen_activity,
+            oxygen_partial_pressure_pascal,
+            total_gas_pressure_pascal: mixture.gas_pressure_pascal(),
+            uv_power: reaction_context.uv_power,
+            total_light_power,
+            oxidizing_strength,
+            reducing_strength,
+            free_complexable_metal_activity,
+            complexed_metal_mol_per_bucket,
+            available_surface_sites_mol_per_bucket,
             palladium_available,
         };
         context.solvent_type = if context.is_basic() {
@@ -240,6 +309,36 @@ impl SelectivityContext {
 
     pub fn has_hydrogen(&self) -> bool {
         self.hydrogen_mol_per_bucket > TRACE_CONCENTRATION_MOL_PER_BUCKET
+            || self.hydrogen_partial_pressure_pascal > STANDARD_PRESSURE_PASCAL * 1.0e-6
+    }
+
+    pub fn has_uv(&self) -> bool {
+        self.uv_power > 0.0
+    }
+
+    pub fn is_oxygen_rich(&self) -> bool {
+        self.oxygen_activity > TRACE_CONCENTRATION_MOL_PER_BUCKET
+            || self.oxygen_partial_pressure_pascal > STANDARD_PRESSURE_PASCAL * 1.0e-4
+    }
+
+    pub fn is_oxidizing(&self) -> bool {
+        self.oxidizing_strength > self.reducing_strength + TRACE_CONCENTRATION_MOL_PER_BUCKET
+    }
+
+    pub fn is_reducing(&self) -> bool {
+        self.reducing_strength > self.oxidizing_strength + TRACE_CONCENTRATION_MOL_PER_BUCKET
+    }
+
+    pub fn has_available_surface(&self) -> bool {
+        self.available_surface_sites_mol_per_bucket > TRACE_CONCENTRATION_MOL_PER_BUCKET
+    }
+
+    pub fn has_free_complexable_metal(&self) -> bool {
+        self.free_complexable_metal_activity > TRACE_CONCENTRATION_MOL_PER_BUCKET
+    }
+
+    pub fn has_complexed_metal(&self) -> bool {
+        self.complexed_metal_mol_per_bucket > TRACE_CONCENTRATION_MOL_PER_BUCKET
     }
 }
 
@@ -275,6 +374,8 @@ pub enum ReactionType {
     FischerEsterification,
     /// Nucleophilic addition to carbonyl
     CarbonylAddition,
+    /// Hydride reduction of aldehydes and ketones to alcohols
+    CarbonylReduction,
     /// Electrophilic addition to alkene/alkyne
     ElectrophilicAddition,
     /// Halogenation at the alpha carbon of an enolizable carbonyl
@@ -614,6 +715,88 @@ fn dominant_solvent_type(registry: &ChemistryRegistry, mixture: &Mixture) -> Opt
     }
 }
 
+fn max_known_activity(
+    registry: &ChemistryRegistry,
+    mixture: &Mixture,
+    substance_id: &SubstanceId,
+    phases: &[MixturePhase],
+) -> ChemistryResult<f64> {
+    if registry.substance(substance_id).is_err() {
+        return Ok(0.0);
+    }
+    phases.iter().try_fold(0.0_f64, |current, phase| {
+        Ok(current.max(mixture.activity_of(registry, substance_id, *phase)?))
+    })
+}
+
+fn known_partial_pressure(
+    registry: &ChemistryRegistry,
+    mixture: &Mixture,
+    substance_id: &SubstanceId,
+) -> f64 {
+    if registry.substance(substance_id).is_err() {
+        0.0
+    } else {
+        mixture.gas_partial_pressure_pascal(substance_id)
+    }
+}
+
+fn redox_role_strengths(
+    registry: &ChemistryRegistry,
+    mixture: &Mixture,
+) -> ChemistryResult<(f64, f64)> {
+    let mut oxidizing_strength = 0.0;
+    let mut reducing_strength = 0.0;
+    for substance_id in mixture.substances() {
+        let activity = max_known_activity(
+            registry,
+            mixture,
+            substance_id,
+            &[
+                MixturePhase::Aqueous,
+                MixturePhase::Organic,
+                MixturePhase::Gas,
+            ],
+        )?;
+        if activity <= TRACE_CONCENTRATION_MOL_PER_BUCKET {
+            continue;
+        }
+        let substance = registry.substance(substance_id)?;
+        for role in &substance.redox_roles {
+            match role {
+                RedoxRole::Oxidant => oxidizing_strength += activity,
+                RedoxRole::Reductant => reducing_strength += activity,
+                RedoxRole::OxidantAndReductant => {
+                    oxidizing_strength += activity;
+                    reducing_strength += activity;
+                }
+            }
+        }
+    }
+    Ok((oxidizing_strength, reducing_strength))
+}
+
+fn metal_availability(
+    registry: &ChemistryRegistry,
+    mixture: &Mixture,
+) -> ChemistryResult<(f64, f64)> {
+    let mut free_metal_activity = 0.0_f64;
+    let mut complexed_metal = 0.0_f64;
+    let mut seen_central_ions = std::collections::BTreeSet::new();
+    for spec in registry.complex_specs() {
+        if seen_central_ions.insert(spec.central_ion.clone()) {
+            free_metal_activity = free_metal_activity.max(max_known_activity(
+                registry,
+                mixture,
+                &spec.central_ion,
+                &[MixturePhase::Aqueous, MixturePhase::Organic],
+            )?);
+        }
+        complexed_metal += mixture.concentration_of(&spec.id);
+    }
+    Ok((free_metal_activity, complexed_metal))
+}
+
 fn organic_solvent_looks_polar_aprotic(id: &str) -> bool {
     matches!(
         id,
@@ -633,9 +816,14 @@ fn organic_solvent_looks_polar_aprotic(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chemistry::complex::{ComplexLigand, ComplexSpec};
     use crate::chemistry::mixture::Mixture;
+    use crate::chemistry::mixture::STANDARD_PRESSURE_PASCAL;
+    use crate::chemistry::redox::RedoxRole;
     use crate::chemistry::simulation::ReactionContext;
-    use crate::chemistry::substance::{Substance, SubstancePhaseProperties};
+    use crate::chemistry::substance::{
+        LiquidPhasePreference, SolventRole, Substance, SubstancePhaseProperties,
+    };
     use crate::chemistry::ChemistryRegistryBuilder;
 
     #[test]
@@ -726,5 +914,140 @@ mod tests {
         assert_eq!(context.temperature, 320.0);
         assert!(context.is_acidic());
         assert_eq!(context.solvent_type, SolventType::Acidic);
+    }
+
+    #[test]
+    fn selectivity_context_uses_gases_light_surfaces_and_redox_roles() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 1000.0, 373.15, 75.0, 40_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(
+                Substance::new("destroy:hydrogen", 0, 2.0, 70.0, 20.0, 28.0, 900.0)
+                    .with_phase_properties(SubstancePhaseProperties {
+                        preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+                        aqueous_solubility_mol_per_bucket: Some(0.0),
+                        organic_solubility_mol_per_bucket: Some(0.0),
+                        can_precipitate: false,
+                        can_form_liquid_phase: false,
+                        solvent_role: SolventRole::NotSolvent,
+                    })
+                    .with_redox_roles(vec![RedoxRole::Reductant]),
+            )
+            .substance(
+                Substance::new("destroy:oxygen", 0, 32.0, 1_140.0, 90.0, 29.4, 6_820.0)
+                    .with_phase_properties(SubstancePhaseProperties {
+                        preferred_liquid_phase: LiquidPhasePreference::Aqueous,
+                        aqueous_solubility_mol_per_bucket: Some(0.0),
+                        organic_solubility_mol_per_bucket: Some(0.0),
+                        can_precipitate: false,
+                        can_form_liquid_phase: false,
+                        solvent_role: SolventRole::NotSolvent,
+                    })
+                    .with_redox_roles(vec![RedoxRole::Oxidant]),
+            )
+            .build()
+            .unwrap();
+        let mut mixture = Mixture::new(298.15).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:water", 1.0)
+            .unwrap();
+        mixture
+            .exchange_gases_with_atmosphere(
+                &registry,
+                &[
+                    (SubstanceId::from("destroy:hydrogen"), 0.8),
+                    (SubstanceId::from("destroy:oxygen"), 0.2),
+                ],
+                STANDARD_PRESSURE_PASCAL,
+                10.0,
+                1.0,
+            )
+            .unwrap();
+        let context = ReactionContext::default()
+            .with_uv_power(0.5)
+            .unwrap()
+            .with_open_atmosphere(
+                [(SubstanceId::from("destroy:hydrogen"), 1.0)],
+                STANDARD_PRESSURE_PASCAL,
+                1.0,
+            )
+            .unwrap();
+        let mut context = context;
+        context.add_external_catalyst("palladium", 0.1).unwrap();
+
+        let selectivity = SelectivityContext::from_mixture(&registry, &mixture, &context).unwrap();
+
+        assert!(selectivity.has_hydrogen());
+        assert!(selectivity.is_oxygen_rich());
+        assert!(selectivity.has_uv());
+        assert!(selectivity.palladium_available);
+        assert!(selectivity.has_available_surface());
+        assert!(selectivity.total_gas_pressure_pascal > 0.0);
+        assert!(selectivity.total_light_power >= 0.5);
+        assert!(selectivity.oxidizing_strength > 0.0);
+        assert!(selectivity.reducing_strength > 0.0);
+    }
+
+    #[test]
+    fn selectivity_context_distinguishes_free_and_complexed_metals() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 1000.0, 373.15, 75.0, 40_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(Substance::new(
+                "metal:copper_ion",
+                2,
+                63.55,
+                1000.0,
+                f64::MAX,
+                50.0,
+                0.0,
+            ))
+            .substance(Substance::new(
+                "ligand:ammonia",
+                0,
+                17.0,
+                680.0,
+                240.0,
+                35.0,
+                20_000.0,
+            ))
+            .complex_spec(ComplexSpec::new(
+                "complex:copper_tetraammine",
+                "metal:copper_ion",
+                [ComplexLigand::new("ligand:ammonia", 4)],
+                2,
+                1.0e8,
+            ))
+            .build()
+            .unwrap();
+
+        let mut free = Mixture::new(298.15).unwrap();
+        free.add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        free.add_substance(&registry, "metal:copper_ion", 0.05)
+            .unwrap();
+        let free_context =
+            SelectivityContext::from_mixture(&registry, &free, &ReactionContext::default())
+                .unwrap();
+
+        let mut bound = Mixture::new(298.15).unwrap();
+        bound
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        bound
+            .add_substance(&registry, "complex:copper_tetraammine", 0.05)
+            .unwrap();
+        let bound_context =
+            SelectivityContext::from_mixture(&registry, &bound, &ReactionContext::default())
+                .unwrap();
+
+        assert!(free_context.has_free_complexable_metal());
+        assert!(!free_context.has_complexed_metal());
+        assert!(!bound_context.has_free_complexable_metal());
+        assert!(bound_context.has_complexed_metal());
     }
 }

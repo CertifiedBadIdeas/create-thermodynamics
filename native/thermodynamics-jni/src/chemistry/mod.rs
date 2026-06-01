@@ -40,6 +40,8 @@ pub mod solution;
 #[path = "core/substance.rs"]
 pub mod substance;
 pub mod synthesis;
+#[path = "core/thermodynamics.rs"]
+pub mod thermodynamics;
 
 #[path = "kinetics/mod.rs"]
 pub mod selectivity;
@@ -61,7 +63,8 @@ pub fn destroy_registry_with_generated_reactions_builder(
 #[cfg(test)]
 mod tests {
     use super::catalysis::{CatalystSurfaceId, CatalystSurfaceSpec};
-    use super::complex::{ComplexLigand, ComplexSpec};
+    use super::complex::{ComplexGeometry, ComplexLigand, ComplexSpec, LigandExchangeLability};
+    use super::condition::{AcidityCondition, ReactionCondition};
     use super::destroy_registry_builder;
     use super::error::ChemistryError;
     use super::kinetics::{
@@ -69,11 +72,17 @@ mod tests {
     };
     use super::mixture::{Mixture, MixturePhase};
     use super::reaction::{Reaction, StoichiometricTerm};
+    use super::redox::RedoxRole;
     use super::registry::{ChemistryRegistryBuilder, ReactionCandidateScratch};
+    use super::selectivity::{
+        NucleophileStrength, ReactionType, SelectivityContext, SelectivityEngine,
+        SelectivityProfile, SiteDescriptorBuilder,
+    };
     use super::simulation::{
         react_for_tick, react_for_tick_with_context, react_until_equilibrium, ReactionContext,
     };
-    use super::substance::{Substance, SubstanceId};
+    use super::solution::PrecipitationSpec;
+    use super::substance::{Substance, SubstanceId, SubstancePhaseProperties};
     use super::{DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_REGISTERED_REACTION_COUNT};
 
     fn water_id() -> SubstanceId {
@@ -233,6 +242,10 @@ mod tests {
         Substance::new(id, 0, 10.0, 1_000.0, 373.0, 100.0, 20_000.0)
     }
 
+    fn neutral_substance(id: &'static str, molar_mass: f64) -> Substance {
+        Substance::new(id, 0, molar_mass, 1_000.0, 373.0, 100.0, 20_000.0)
+    }
+
     fn surface_test_registry(reaction: Reaction) -> super::ChemistryRegistry {
         ChemistryRegistryBuilder::new()
             .substance(test_substance("a"))
@@ -259,6 +272,96 @@ mod tests {
             )
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn external_products_are_counted_once_in_registry_validation() {
+        ChemistryRegistryBuilder::new()
+            .substance(neutral_substance("a", 10.0))
+            .substance(neutral_substance("b", 5.0))
+            .reaction(
+                Reaction::builder("external_product_balance")
+                    .reactant("a", 1, 1)
+                    .product("b", 1)
+                    .chemical_external_product("external:fragment", 1.0, 5.0, 0)
+                    .build(),
+            )
+            .build()
+            .expect("external product must be counted exactly once");
+    }
+
+    #[test]
+    fn empty_reaction_and_substance_ids_are_rejected() {
+        let reaction_error = ChemistryRegistryBuilder::new()
+            .substance(test_substance("a"))
+            .substance(test_substance("b"))
+            .reaction(
+                Reaction::builder("")
+                    .reactant("a", 1, 1)
+                    .product("b", 1)
+                    .build(),
+            )
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            reaction_error,
+            ChemistryError::InvalidReaction { .. }
+        ));
+
+        let substance_error = ChemistryRegistryBuilder::new()
+            .substance(test_substance(""))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            substance_error,
+            ChemistryError::InvalidSubstance { .. }
+        ));
+    }
+
+    #[test]
+    fn external_catalyst_adds_surface_sites_without_overwriting() {
+        let mut context = ReactionContext::default();
+        context
+            .add_external_catalyst("surface:nickel", 1.0)
+            .unwrap();
+        context
+            .add_external_catalyst("surface:nickel", 1.0)
+            .unwrap();
+
+        assert_eq!(context.external_catalysts["surface:nickel"], 2.0);
+        assert_eq!(
+            context
+                .surfaces
+                .get(&CatalystSurfaceId::from("surface:nickel"))
+                .unwrap()
+                .total_sites_mol_per_bucket,
+            2.0
+        );
+    }
+
+    #[test]
+    fn external_products_are_recorded_outside_mixture() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(test_substance("a"))
+            .substance(test_substance("b"))
+            .reaction(
+                Reaction::builder("vented_external_product")
+                    .reactant("a", 1, 1)
+                    .product("b", 1)
+                    .chemical_external_product("external:vented", 1.0, 0.0, 0)
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture.add_substance(&registry, "a", 1.0).unwrap();
+        let mut context = ReactionContext::default();
+
+        assert!(react_for_tick_with_context(&registry, &mut mixture, &mut context, 1).unwrap());
+        assert!(context.external_products["external:vented"] > 0.0);
+        assert!(mixture.concentration_of(&"external:vented".into()) == 0.0);
     }
 
     fn channel_product_registry(
@@ -907,6 +1010,322 @@ mod tests {
     }
 
     #[test]
+    fn invalid_complex_coordination_fails_registry_build() {
+        let error = ChemistryRegistryBuilder::new()
+            .substance(Substance::new(
+                "metal",
+                2,
+                10.0,
+                1_000.0,
+                f64::MAX,
+                100.0,
+                20_000.0,
+            ))
+            .substance(
+                Substance::new("ligand", 0, 5.0, 1_000.0, 373.0, 100.0, 20_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_unlimited()),
+            )
+            .complex_spec(
+                ComplexSpec::new(
+                    "metal_ligand",
+                    "metal",
+                    [ComplexLigand::new("ligand", 2)],
+                    2,
+                    1.0e3,
+                )
+                .with_coordination_number(4)
+                .with_geometry(ComplexGeometry::SquarePlanar),
+            )
+            .build()
+            .unwrap_err();
+
+        assert!(matches!(error, ChemistryError::InvalidReaction { .. }));
+    }
+
+    #[test]
+    fn complexation_competes_with_precipitation() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(Substance::new(
+                "destroy:water",
+                0,
+                18.0,
+                1_000.0,
+                373.0,
+                75.0,
+                40_000.0,
+            ))
+            .substance(Substance::new(
+                "destroy:silver_ion",
+                1,
+                107.8682,
+                1_000.0,
+                f64::MAX,
+                100.0,
+                20_000.0,
+            ))
+            .substance(Substance::new(
+                "destroy:chloride",
+                -1,
+                35.45,
+                1_000.0,
+                f64::MAX,
+                100.0,
+                20_000.0,
+            ))
+            .substance(
+                Substance::new("destroy:ammonia", 0, 17.031, 1_000.0, 400.0, 80.0, 23_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_unlimited()),
+            )
+            .substance(
+                Substance::new(
+                    "destroy:silver_chloride",
+                    0,
+                    143.3182,
+                    1_000.0,
+                    728.0,
+                    100.0,
+                    20_000.0,
+                )
+                .with_phase_properties(SubstancePhaseProperties {
+                    can_precipitate: true,
+                    can_form_liquid_phase: false,
+                    aqueous_solubility_mol_per_bucket: Some(0.0),
+                    organic_solubility_mol_per_bucket: Some(0.0),
+                    ..SubstancePhaseProperties::aqueous_unlimited()
+                }),
+            )
+            .precipitation(PrecipitationSpec::new(
+                "destroy:silver_chloride",
+                "destroy:silver_chloride",
+                [
+                    (SubstanceId::from("destroy:silver_ion"), 1),
+                    (SubstanceId::from("destroy:chloride"), 1),
+                ],
+                1.0e-4,
+            ))
+            .complex_spec(
+                ComplexSpec::new(
+                    "destroy:silver_diammine",
+                    "destroy:silver_ion",
+                    [ComplexLigand::new("destroy:ammonia", 2)],
+                    1,
+                    1.0e4,
+                )
+                .with_coordination_number(2)
+                .with_geometry(ComplexGeometry::Linear)
+                .with_ligand_exchange_lability(LigandExchangeLability::Labile),
+            )
+            .build()
+            .unwrap();
+
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        mixture
+            .add_substance(&registry, "destroy:silver_ion", 0.02)
+            .unwrap();
+        mixture
+            .add_substance(&registry, "destroy:chloride", 0.02)
+            .unwrap();
+        mixture.equilibrate_solution(&registry).unwrap();
+        let precipitated_before =
+            mixture.concentration_in_phase(&"destroy:silver_chloride".into(), MixturePhase::Solid);
+        assert!(
+            precipitated_before > 0.005,
+            "precipitated before ammonia was {precipitated_before}, silver aq {}, chloride aq {}, silver total {}, chloride total {}",
+            mixture.concentration_in_phase(&"destroy:silver_ion".into(), MixturePhase::Aqueous),
+            mixture.concentration_in_phase(&"destroy:chloride".into(), MixturePhase::Aqueous),
+            mixture.concentration_of(&"destroy:silver_ion".into()),
+            mixture.concentration_of(&"destroy:chloride".into())
+        );
+
+        mixture
+            .add_substance(&registry, "destroy:ammonia", 0.20)
+            .unwrap();
+        mixture.equilibrate_solution(&registry).unwrap();
+
+        let complex = mixture.concentration_of(&"destroy:silver_diammine".into());
+        let precipitated_after =
+            mixture.concentration_in_phase(&"destroy:silver_chloride".into(), MixturePhase::Solid);
+        assert!(
+            complex > 0.001,
+            "silver diammine concentration was {complex}"
+        );
+        assert!(
+            precipitated_after < precipitated_before,
+            "precipitate before {precipitated_before}, after {precipitated_after}"
+        );
+    }
+
+    #[test]
+    fn calculated_ph_controls_reaction_conditions_during_simulation() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 1_000.0, 373.0, 75.0, 40_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(Substance::new(
+                "destroy:proton",
+                1,
+                1.0,
+                1_000.0,
+                f64::MAX,
+                100.0,
+                20_000.0,
+            ))
+            .substance(test_substance("organic:acid_labile_start"))
+            .substance(test_substance("organic:acid_labile_product"))
+            .reaction(
+                Reaction::builder("organic:acid_labile_conversion")
+                    .reactant("organic:acid_labile_start", 1, 1)
+                    .product("organic:acid_labile_product", 1)
+                    .condition(
+                        ReactionCondition::new("acid-labile conversion requires acidic solution")
+                            .acidity(AcidityCondition::Acidic),
+                    )
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        mixture
+            .add_substance(&registry, "organic:acid_labile_start", 0.1)
+            .unwrap();
+
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+        assert_eq!(
+            mixture.concentration_of(&"organic:acid_labile_product".into()),
+            0.0
+        );
+
+        mixture
+            .add_substance(&registry, "destroy:proton", 0.01)
+            .unwrap();
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+        assert!(
+            mixture.concentration_of(&"organic:acid_labile_product".into()) > 0.0,
+            "acidic pH calculated from the mixture must unblock acid-sensitive reactions"
+        );
+    }
+
+    #[test]
+    fn gas_pressure_from_mixture_controls_pressure_sensitive_reactions() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 1_000.0, 373.0, 75.0, 40_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(test_substance("organic:pressure_start"))
+            .substance(test_substance("organic:pressure_product"))
+            .substance(
+                Substance::new("destroy:hydrogen", 0, 2.0, 70.0, 20.0, 28.0, 900.0)
+                    .with_phase_properties(SubstancePhaseProperties {
+                        preferred_liquid_phase: super::substance::LiquidPhasePreference::Aqueous,
+                        aqueous_solubility_mol_per_bucket: Some(0.0),
+                        organic_solubility_mol_per_bucket: Some(0.0),
+                        can_precipitate: false,
+                        can_form_liquid_phase: false,
+                        solvent_role: super::substance::SolventRole::NotSolvent,
+                    }),
+            )
+            .reaction(
+                Reaction::builder("organic:pressure_sensitive_conversion")
+                    .reactant("organic:pressure_start", 1, 1)
+                    .product("organic:pressure_product", 1)
+                    .condition(
+                        ReactionCondition::new("hydrogen pressure must be present")
+                            .gas_pressure_atm(0.5),
+                    )
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let mut mixture = Mixture::new(298.0).unwrap();
+        mixture
+            .add_substance(&registry, "organic:pressure_start", 0.1)
+            .unwrap();
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+        assert_eq!(
+            mixture.concentration_of(&"organic:pressure_product".into()),
+            0.0
+        );
+
+        mixture
+            .exchange_gases_with_atmosphere(
+                &registry,
+                &[(SubstanceId::from("destroy:hydrogen"), 1.0)],
+                super::mixture::STANDARD_PRESSURE_PASCAL,
+                10.0,
+                1.0,
+            )
+            .unwrap();
+        react_for_tick(&registry, &mut mixture, 1).unwrap();
+        assert!(
+            mixture.concentration_of(&"organic:pressure_product".into()) > 0.0,
+            "gas pressure calculated from the gas phase must unblock pressure-sensitive reactions"
+        );
+    }
+
+    #[test]
+    fn redox_environment_from_inorganic_species_changes_organic_selectivity() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(
+                Substance::new("destroy:water", 0, 18.0, 1_000.0, 373.0, 75.0, 40_000.0)
+                    .with_phase_properties(SubstancePhaseProperties::aqueous_solvent()),
+            )
+            .substance(
+                neutral_substance("inorganic:oxidant", 50.0)
+                    .with_redox_roles(vec![RedoxRole::Oxidant]),
+            )
+            .build()
+            .unwrap();
+        let profile = SelectivityProfile::new(
+            ReactionType::CarbonylReduction,
+            SiteDescriptorBuilder::aldehyde(),
+        )
+        .with_nucleophile_strength(NucleophileStrength::Strong)
+        .never_suppress();
+
+        let mut neutral = Mixture::new(298.0).unwrap();
+        neutral
+            .add_substance(&registry, "destroy:water", 55.5)
+            .unwrap();
+        let neutral_context =
+            SelectivityContext::from_mixture(&registry, &neutral, &ReactionContext::default())
+                .unwrap();
+        let neutral_effect = SelectivityEngine::evaluate_profile(&profile, &neutral_context);
+
+        let mut oxidizing = neutral.clone();
+        oxidizing
+            .add_substance(&registry, "inorganic:oxidant", 0.5)
+            .unwrap();
+        let oxidizing_context =
+            SelectivityContext::from_mixture(&registry, &oxidizing, &ReactionContext::default())
+                .unwrap();
+        let oxidizing_effect = SelectivityEngine::evaluate_profile(&profile, &oxidizing_context);
+
+        assert!(oxidizing_context.is_oxidizing());
+        assert!(
+            oxidizing_effect.rate_multiplier < neutral_effect.rate_multiplier,
+            "oxidizing inorganic species must slow reduction-sensitive organic profiles"
+        );
+        assert!(
+            oxidizing_effect.activation_delta_kj_per_mol
+                > neutral_effect.activation_delta_kj_per_mol
+        );
+    }
+
+    #[test]
     fn surface_catalyst_is_required_and_limited_by_free_sites() {
         let registry = surface_test_registry(
             Reaction::builder("surface:isomerization")
@@ -1082,5 +1501,119 @@ mod tests {
 
         assert!(report.reached_equilibrium);
         assert_eq!(report.ticks, 1);
+    }
+
+    #[test]
+    fn reaction_thermodynamics_derives_equilibrium_constant_from_gibbs_energy() {
+        let thermo =
+            super::thermodynamics::ReactionThermodynamics::from_equilibrium_constant_at_kelvin(
+                10.0, 298.15,
+            )
+            .unwrap();
+
+        assert!(
+            (thermo.gibbs_free_energy_change_kj_per_mol
+                - super::thermodynamics::delta_g_from_equilibrium_constant(10.0, 298.15).unwrap())
+            .abs()
+                < 1.0e-12
+        );
+        assert!(
+            (thermo.equilibrium_constant_at_kelvin(0.0, 298.15).unwrap() - 10.0).abs() < 1.0e-9
+        );
+    }
+
+    #[test]
+    fn reaction_equilibrium_constant_tracks_temperature_from_enthalpy_and_entropy() {
+        let thermo =
+            super::thermodynamics::ReactionThermodynamics::from_equilibrium_constant_at_kelvin(
+                1.0, 298.15,
+            )
+            .unwrap();
+
+        let cold = thermo.equilibrium_constant_at_kelvin(20.0, 280.0).unwrap();
+        let hot = thermo.equilibrium_constant_at_kelvin(20.0, 350.0).unwrap();
+
+        assert!(
+            hot > cold,
+            "endothermic equilibrium constant should increase with temperature: cold={cold}, hot={hot}"
+        );
+    }
+
+    #[test]
+    fn thermodynamic_rate_factor_stops_forward_reaction_at_equilibrium() {
+        let registry = ChemistryRegistryBuilder::new()
+            .substance(test_substance("a"))
+            .substance(test_substance("b"))
+            .reaction(
+                Reaction::builder("a_to_b")
+                    .reactant("a", 1, 1)
+                    .product("b", 1)
+                    .product_phase("b", MixturePhase::Organic)
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .gibbs_free_energy_change_kj_per_mol(0.0)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let reaction = registry.reaction(&"a_to_b".into()).unwrap();
+
+        let mut far_from_equilibrium = Mixture::new(298.15).unwrap();
+        far_from_equilibrium
+            .add_substance(&registry, "a", 1.0)
+            .unwrap();
+        let forward_rate = super::simulation::reaction_rate_mol_per_bucket_per_tick(
+            &registry,
+            &far_from_equilibrium,
+            reaction,
+        )
+        .unwrap();
+
+        let mut at_equilibrium = Mixture::new(298.15).unwrap();
+        at_equilibrium.add_substance(&registry, "a", 1.0).unwrap();
+        at_equilibrium.add_substance(&registry, "b", 4.0).unwrap();
+        let equilibrium_rate = super::simulation::reaction_rate_mol_per_bucket_per_tick(
+            &registry,
+            &at_equilibrium,
+            reaction,
+        )
+        .unwrap();
+
+        assert!(forward_rate > 0.0);
+        assert_eq!(equilibrium_rate, 0.0);
+    }
+
+    #[test]
+    fn reverse_reactions_must_have_mirrored_gibbs_energy() {
+        let error = ChemistryRegistryBuilder::new()
+            .substance(test_substance("a"))
+            .substance(test_substance("b"))
+            .reaction(
+                Reaction::builder("a_to_b")
+                    .reactant("a", 1, 1)
+                    .product("b", 1)
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .gibbs_free_energy_change_kj_per_mol(-5.0)
+                    .reverse_reaction_id("b_to_a")
+                    .build(),
+            )
+            .reaction(
+                Reaction::builder("b_to_a")
+                    .reactant("b", 1, 1)
+                    .product("a", 1)
+                    .pre_exponential_factor(1.0e12)
+                    .activation_energy_kj_per_mol(0.0)
+                    .gibbs_free_energy_change_kj_per_mol(0.0)
+                    .reverse_reaction_id("a_to_b")
+                    .build(),
+            )
+            .build()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ChemistryError::ReversibleThermodynamicsMismatch { .. }
+        ));
     }
 }
