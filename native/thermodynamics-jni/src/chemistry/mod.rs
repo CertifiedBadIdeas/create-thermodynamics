@@ -1,3 +1,5 @@
+#[path = "core/alloy.rs"]
+pub mod alloy;
 #[path = "molecule/canonical.rs"]
 pub mod canonical;
 #[path = "data/catalog.rs"]
@@ -17,6 +19,10 @@ pub mod frowns;
 pub mod functional_group;
 #[path = "core/kinetics.rs"]
 pub mod kinetics;
+#[path = "core/metallurgy/mod.rs"]
+pub mod metallurgy;
+#[path = "data/metallurgy.rs"]
+pub mod metallurgy_data;
 #[path = "core/mixture.rs"]
 pub mod mixture;
 #[path = "molecule/mod.rs"]
@@ -47,12 +53,17 @@ pub mod thermodynamics;
 pub mod selectivity;
 
 pub use error::{ChemistryError, ChemistryResult};
-pub use reactions::{DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_REGISTERED_REACTION_COUNT};
+pub use reactions::{
+    DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_METALLURGY_REACTION_COUNT,
+    DESTROY_REGISTERED_REACTION_COUNT,
+};
 pub use registry::{ChemistryRegistry, ChemistryRegistryBuilder};
 
 pub fn destroy_registry_builder() -> ChemistryResult<ChemistryRegistryBuilder> {
     let builder = catalog::destroy_substances_registry_builder()?;
-    reactions::destroy_reactions_registry_builder(builder)
+    let builder = reactions::destroy_reactions_registry_builder(builder)?;
+    let builder = reactions::destroy_metallurgy_reactions_registry_builder(builder)?;
+    Ok(builder.metallurgical_systems(metallurgy_data::default_metallurgical_systems()))
 }
 
 pub fn destroy_registry_with_generated_reactions_builder(
@@ -72,7 +83,7 @@ mod tests {
     };
     use super::mixture::{Mixture, MixturePhase};
     use super::reaction::{Reaction, StoichiometricTerm};
-    use super::redox::RedoxRole;
+    use super::redox::{apply_electrolysis_cell, ElectrodeProcess, ElectrolysisCell, RedoxRole};
     use super::registry::{ChemistryRegistryBuilder, ReactionCandidateScratch};
     use super::selectivity::{
         NucleophileStrength, ReactionType, SelectivityContext, SelectivityEngine,
@@ -83,7 +94,10 @@ mod tests {
     };
     use super::solution::PrecipitationSpec;
     use super::substance::{Substance, SubstanceId, SubstancePhaseProperties};
-    use super::{DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_REGISTERED_REACTION_COUNT};
+    use super::{
+        DESTROY_EXPLICIT_REACTION_COUNT, DESTROY_METALLURGY_REACTION_COUNT,
+        DESTROY_REGISTERED_REACTION_COUNT,
+    };
 
     fn water_id() -> SubstanceId {
         "destroy:water".into()
@@ -1458,10 +1472,112 @@ mod tests {
 
         assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 118);
         assert_eq!(
-            DESTROY_REGISTERED_REACTION_COUNT,
+            DESTROY_REGISTERED_REACTION_COUNT + DESTROY_METALLURGY_REACTION_COUNT,
             registry.reactions().count()
         );
         assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 155);
+        assert_eq!(DESTROY_METALLURGY_REACTION_COUNT, 28);
+    }
+
+    #[test]
+    fn carbonate_calcination_requires_high_temperature() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let carbonate = SubstanceId::from("destroy:calcium_carbonate");
+        let oxide = SubstanceId::from("destroy:calcium_oxide");
+
+        let mut cold = Mixture::new(900.0).unwrap();
+        cold.add_substance(&registry, carbonate.clone(), 0.1)
+            .unwrap();
+        assert!(!react_for_tick(&registry, &mut cold, 1).unwrap());
+        assert_eq!(cold.concentration_of(&oxide), 0.0);
+
+        let mut hot = Mixture::new(1_250.0).unwrap();
+        hot.add_substance(&registry, carbonate, 0.1).unwrap();
+        assert!(react_for_tick(&registry, &mut hot, 1).unwrap());
+        assert!(hot.concentration_of(&oxide) > 0.0);
+        assert!(hot.concentration_of(&SubstanceId::from("destroy:carbon_dioxide")) > 0.0);
+    }
+
+    #[test]
+    fn carbon_monoxide_reduction_produces_metal_and_gas() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let oxide = SubstanceId::from("destroy:copper_ii_oxide");
+        let metal = SubstanceId::from("destroy:copper_metal");
+        let carbon_monoxide = SubstanceId::from("destroy:carbon_monoxide");
+        let carbon_dioxide = SubstanceId::from("destroy:carbon_dioxide");
+        let reaction = registry
+            .reaction(&"destroy:copper_ii_oxide.carbon_monoxide_reduction".into())
+            .unwrap();
+        let redox = reaction
+            .redox
+            .as_ref()
+            .expect("metallurgical oxide reduction must be redox-annotated");
+        assert_eq!(redox.transferred_electrons, 2);
+        assert_eq!(
+            redox.oxidation_half_id.as_deref(),
+            Some("destroy:carbon_monoxide_to_carbon_dioxide_in_molten_oxide")
+        );
+        assert_eq!(
+            redox.reduction_half_id.as_deref(),
+            Some("destroy:copper_ii_oxide.molten_oxide_reduction_half")
+        );
+        assert!(registry
+            .redox_half_reaction("destroy:copper_ii_oxide.molten_oxide_reduction_half")
+            .is_some());
+
+        let mut mixture = Mixture::new(1_450.0).unwrap();
+        mixture
+            .add_substance(&registry, oxide.clone(), 0.1)
+            .unwrap();
+        mixture
+            .add_substance(&registry, carbon_monoxide.clone(), 0.1)
+            .unwrap();
+
+        assert!(react_for_tick(&registry, &mut mixture, 1).unwrap());
+        assert!(mixture.concentration_of(&oxide) < 0.1);
+        assert!(mixture.concentration_of(&carbon_monoxide) < 0.1);
+        assert!(mixture.concentration_in_phase(&metal, MixturePhase::MoltenMetal) > 0.0);
+        assert!(mixture.concentration_in_phase(&carbon_dioxide, MixturePhase::Gas) > 0.0);
+    }
+
+    #[test]
+    fn molten_oxide_electrolysis_produces_metal_and_oxygen_without_free_oxide_seed() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let oxide = SubstanceId::from("destroy:copper_ii_oxide");
+        let metal = SubstanceId::from("destroy:copper_metal");
+        let oxygen = SubstanceId::from("destroy:oxygen");
+        let oxide_ion = SubstanceId::from("destroy:oxide");
+        let mut mixture = Mixture::new(1_800.0).unwrap();
+        mixture
+            .add_substance(&registry, oxide.clone(), 0.01)
+            .unwrap();
+
+        let cell = ElectrolysisCell::new(
+            ElectrodeProcess::anode("destroy:oxide_to_oxygen_in_molten_slag")
+                .in_phase(MixturePhase::MoltenSlag),
+            ElectrodeProcess::cathode(
+                "destroy:copper_ii_oxide.molten_oxide_electrolysis_reduction_half",
+            )
+            .in_phase(MixturePhase::MoltenSlag),
+            10.0,
+        );
+        let report = apply_electrolysis_cell(
+            &registry,
+            &mut mixture,
+            &cell,
+            super::redox::FARADAY_CONSTANT_COULOMBS_PER_MOL * 0.002,
+            1.0,
+        )
+        .unwrap();
+
+        assert!((report.transferred_electrons_mol_per_bucket - 0.002).abs() < 1.0e-12);
+        assert!(mixture.concentration_in_phase(&metal, MixturePhase::MoltenMetal) > 0.0);
+        assert!(mixture.concentration_in_phase(&oxygen, MixturePhase::Gas) > 0.0);
+        assert!(mixture.concentration_of(&oxide) < 0.01);
+        assert!(
+            mixture.concentration_of(&oxide_ion)
+                <= super::mixture::TRACE_CONCENTRATION_MOL_PER_BUCKET
+        );
     }
 
     #[test]

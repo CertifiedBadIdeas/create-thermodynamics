@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::alloy::AlloyPhaseSnapshot;
 use super::catalysis::{CatalystSurfaceId, CatalystSurfaceSpec};
 use super::complex::ComplexSpec;
 use super::error::{ChemistryError, ChemistryResult};
 use super::kinetics::{ChannelConditionEffect, ReactionChannel};
+use super::metallurgy::{
+    metallurgical_state_from_alloy_phase, MetallurgicalState, MetallurgicalSystem,
+};
 use super::mixture::MixturePhase;
 use super::reaction::{ProductDistribution, Reaction, ReactionId, StoichiometricTerm};
 use super::redox::{
@@ -15,8 +19,8 @@ use super::solution::{
     IndexedPrecipitation, PrecipitationSpec,
 };
 use super::substance::{
-    MaterialFormulaUnit, SolventRole, Substance, SubstanceAggregateState, SubstanceId,
-    SubstanceRepresentation, SubstanceTagId,
+    LiquidPhasePreference, MaterialFormulaUnit, SolventRole, Substance, SubstanceAggregateState,
+    SubstanceId, SubstanceRepresentation, SubstanceTagId,
 };
 
 const MASS_TOLERANCE_GRAMS_PER_MOL: f64 = 1.0e-6;
@@ -143,6 +147,7 @@ pub struct ChemistryRegistry {
     redox_half_reactions: BTreeMap<String, RedoxHalfReaction>,
     catalyst_surface_specs: BTreeMap<CatalystSurfaceId, CatalystSurfaceSpec>,
     complex_specs: Vec<ComplexSpec>,
+    metallurgical_systems: Vec<MetallurgicalSystem>,
 }
 
 impl ChemistryRegistry {
@@ -272,9 +277,41 @@ impl ChemistryRegistry {
         if left == right {
             return SolventMiscibility::FullyMiscible;
         }
+        if self.same_default_miscible_material_melt(left, right) {
+            return SolventMiscibility::FullyMiscible;
+        }
         ordered_pair(left, right)
             .and_then(|key| self.solvent_miscibility.get(&key).copied())
             .unwrap_or(SolventMiscibility::Immiscible)
+    }
+
+    fn same_default_miscible_material_melt(
+        &self,
+        left: SubstanceIndex,
+        right: SubstanceIndex,
+    ) -> bool {
+        let (Ok(left), Ok(right)) = (
+            self.substance_by_index(left),
+            self.substance_by_index(right),
+        ) else {
+            return false;
+        };
+        matches!(
+            (
+                left.phase_properties.preferred_liquid_phase,
+                right.phase_properties.preferred_liquid_phase,
+            ),
+            (
+                LiquidPhasePreference::MoltenMetal,
+                LiquidPhasePreference::MoltenMetal
+            ) | (
+                LiquidPhasePreference::MoltenSlag,
+                LiquidPhasePreference::MoltenSlag
+            )
+        ) && left.phase_properties.can_form_liquid_phase
+            && right.phase_properties.can_form_liquid_phase
+            && left.phase_properties.solvent_role == SolventRole::NotSolvent
+            && right.phase_properties.solvent_role == SolventRole::NotSolvent
     }
 
     pub(crate) fn gas_solubility(&self, substance: SubstanceIndex) -> Option<&GasSolubilityModel> {
@@ -312,6 +349,24 @@ impl ChemistryRegistry {
     pub fn complex_specs(&self) -> impl Iterator<Item = &ComplexSpec> {
         self.complex_specs.iter()
     }
+
+    pub fn metallurgical_systems(&self) -> &[MetallurgicalSystem] {
+        &self.metallurgical_systems
+    }
+
+    pub fn metallurgical_state_from_alloy_phase(
+        &self,
+        alloy: &AlloyPhaseSnapshot,
+        previous: Option<&MetallurgicalState>,
+        delta_seconds: f64,
+    ) -> ChemistryResult<MetallurgicalState> {
+        metallurgical_state_from_alloy_phase(
+            alloy,
+            &self.metallurgical_systems,
+            previous,
+            delta_seconds,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -329,6 +384,7 @@ pub struct ChemistryRegistryBuilder {
     redox_pair_specs: Vec<RedoxPairSpec>,
     catalyst_surface_specs: Vec<CatalystSurfaceSpec>,
     complex_specs: Vec<ComplexSpec>,
+    metallurgical_systems: Vec<MetallurgicalSystem>,
 }
 
 impl ChemistryRegistryBuilder {
@@ -392,6 +448,7 @@ impl ChemistryRegistryBuilder {
             redox_pair_specs: Vec::new(),
             catalyst_surface_specs: registry.catalyst_surface_specs.values().cloned().collect(),
             complex_specs: registry.complex_specs.clone(),
+            metallurgical_systems: registry.metallurgical_systems.clone(),
         }
     }
 
@@ -479,6 +536,19 @@ impl ChemistryRegistryBuilder {
         self
     }
 
+    pub fn metallurgical_system(mut self, system: MetallurgicalSystem) -> Self {
+        self.metallurgical_systems.push(system);
+        self
+    }
+
+    pub fn metallurgical_systems(
+        mut self,
+        systems: impl IntoIterator<Item = MetallurgicalSystem>,
+    ) -> Self {
+        self.metallurgical_systems.extend(systems);
+        self
+    }
+
     pub fn build(self) -> ChemistryResult<ChemistryRegistry> {
         let mut redox_half_reactions = BTreeMap::new();
         for half in self.redox_half_reactions {
@@ -508,6 +578,7 @@ impl ChemistryRegistryBuilder {
         }
 
         let catalyst_surface_specs = build_catalyst_surface_specs(&self.catalyst_surface_specs)?;
+        let metallurgical_systems = build_metallurgical_systems(self.metallurgical_systems)?;
 
         let mut substance_map = BTreeMap::new();
         for substance in substances {
@@ -591,6 +662,7 @@ impl ChemistryRegistryBuilder {
             redox_half_reactions,
             catalyst_surface_specs,
             complex_specs: complex_specs.into_iter().map(|(spec, _)| spec).collect(),
+            metallurgical_systems,
         };
         registry.validate_redox_half_reactions()?;
         registry.validate_substance_tags()?;
@@ -986,6 +1058,24 @@ fn channel_product_terms(reaction: &Reaction) -> impl Iterator<Item = &Stoichiom
         .flat_map(|channel| channel.products.iter())
 }
 
+fn build_metallurgical_systems(
+    systems: Vec<MetallurgicalSystem>,
+) -> ChemistryResult<Vec<MetallurgicalSystem>> {
+    let mut ids = BTreeSet::new();
+    let mut result = Vec::new();
+    for system in systems {
+        system.validate()?;
+        if !ids.insert(system.id.clone()) {
+            return Err(ChemistryError::InvalidMixtureState(format!(
+                "metallurgical system '{}' is registered more than once",
+                system.id
+            )));
+        }
+        result.push(system);
+    }
+    Ok(result)
+}
+
 fn product_charge(reaction: &Reaction, registry: &ChemistryRegistry) -> ChemistryResult<f64> {
     if !reaction.channels.is_empty() {
         let external_reactant_charge = reaction
@@ -1310,7 +1400,10 @@ fn build_complex_specs(
                         .phase_properties
                         .organic_solubility_mol_per_bucket
                 }
-                MixturePhase::Gas | MixturePhase::Solid => None,
+                MixturePhase::MoltenMetal
+                | MixturePhase::MoltenSlag
+                | MixturePhase::Gas
+                | MixturePhase::Solid => None,
             };
             if ligand_substance.phase_properties.can_precipitate && ligand_solubility == Some(0.0) {
                 return Err(ChemistryError::InvalidReaction {
