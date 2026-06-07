@@ -74,6 +74,36 @@ impl SelectivityEngine {
                 }
                 score
             }
+            ReactionType::OrganicOxidation => {
+                let mut score = ReactivityScore::new(1.0, "organic oxidation");
+                if context.is_oxidizing() {
+                    score.value *= 1.5 + context.oxidizing_strength.min(4.0) * 0.5;
+                    score.activation_delta -= (context.oxidizing_strength.min(4.0) * 1.5).max(1.0);
+                    score.reason = "oxidizing medium favors organic oxidation".to_string();
+                }
+                if context.is_reducing() {
+                    let penalty = redox_competition_penalty(context);
+                    score.value *= penalty;
+                    score.activation_delta += 5.0 + (1.0 - penalty) * 8.0;
+                    score.reason = "reducing medium competes with organic oxidation".to_string();
+                }
+                if context.is_water_rich()
+                    && matches!(
+                        profile.primary_site.site_kind,
+                        ReactiveSiteKind::Aldehyde | ReactiveSiteKind::Alcohol
+                    )
+                {
+                    score.value *= 1.15;
+                    score.activation_delta -= 0.8;
+                }
+                if context.medium.is_supercritical()
+                    && matches!(context.solvent_type, SolventType::NonPolar)
+                {
+                    score.value *= 0.85;
+                    score.activation_delta += 1.0;
+                }
+                score
+            }
             ReactionType::WittigOlefination
             | ReactionType::HornerWadsworthEmmonsOlefination
             | ReactionType::JuliaOlefination => {
@@ -99,6 +129,65 @@ impl SelectivityEngine {
                 1.0,
                 "electrophilic addition has no specialized selectivity profile yet",
             ),
+            ReactionType::ChainGrowthPolymerization => {
+                // Addition polymerization runs faster as the monomer feed concentrates
+                // and as temperature rises (initiator decomposition). Sterically open
+                // (less substituted) alkenes propagate more readily; the structural
+                // detail is left to the per-site barrier, so the profile only carries
+                // the gentle accessibility bias here.
+                let mut score = ReactivityScore::new(1.0, "chain-growth addition polymerization");
+                score.value *= profile.primary_site.steric_accessibility().max(0.2);
+                if context.is_high_temperature() {
+                    score.value *= 1.3;
+                    score.activation_delta -= 2.0;
+                }
+                score
+            }
+            ReactionType::HydrocarbonCracking => {
+                let mut score = ReactivityScore::new(1.0, "hydrocarbon C-C bond scission");
+                score.value *= (1.0 + profile.primary_site.steric_score).clamp(1.0, 1.8);
+                if profile.primary_site.electronics.resonance_stabilization {
+                    score.value *= 1.4;
+                    score.activation_delta -= 4.0;
+                }
+                if context.is_high_temperature() {
+                    score.value *= 1.5;
+                    score.activation_delta -= 3.0;
+                }
+                if context.is_very_high_temperature() {
+                    score.value *= 3.0;
+                    score.activation_delta -= 8.0;
+                }
+                if context.medium.is_supercritical() {
+                    score.value *= 1.2;
+                    score.activation_delta -= 1.0;
+                }
+                if context.medium.has_gas_liquid_interface() {
+                    score.value *= 1.1;
+                }
+                score
+            }
+            ReactionType::HydrocarbonPyrolysis => {
+                let mut score = ReactivityScore::new(0.6, "hydrocarbon thermal dehydrogenation");
+                score.value *= profile.primary_site.steric_accessibility().max(0.25);
+                if profile.primary_site.electronics.resonance_stabilization {
+                    score.value *= 1.6;
+                    score.activation_delta -= 5.0;
+                }
+                if context.is_high_temperature() {
+                    score.value *= 2.0;
+                    score.activation_delta -= 5.0;
+                }
+                if context.is_very_high_temperature() {
+                    score.value *= 4.0;
+                    score.activation_delta -= 12.0;
+                }
+                if context.medium.is_supercritical() {
+                    score.value *= 1.15;
+                    score.activation_delta -= 1.0;
+                }
+                score
+            }
             ReactionType::SilylEtherFormation
             | ReactionType::SilylEtherCleavage
             | ReactionType::AcetalFormation
@@ -106,7 +195,8 @@ impl SelectivityEngine {
             | ReactionType::CarbamateFormation
             | ReactionType::CarbamateCleavage
             | ReactionType::EsterProtection
-            | ReactionType::EsterHydrolysis => evaluate_protecting_group_profile(profile, context),
+            | ReactionType::EsterHydrolysis
+            | ReactionType::AcylSubstitution => evaluate_protecting_group_profile(profile, context),
             ReactionType::AlphaHalogenation
             | ReactionType::AldolAddition
             | ReactionType::AldolDehydration
@@ -117,6 +207,62 @@ impl SelectivityEngine {
             | ReactionType::PhosphoniumSaltFormation
             | ReactionType::PhosphoniumYlideFormation => {
                 evaluate_alpha_carbon_profile(profile, context)
+            }
+            ReactionType::Lactonization
+            | ReactionType::Lactamization
+            | ReactionType::HeterocycleCondensation => {
+                evaluate_cyclization_profile(profile, context)
+            }
+            ReactionType::DielsAlder => {
+                let mut score = ReactivityScore::new(1.0, "Diels-Alder [4+2] cycloaddition");
+                score.value *= profile.primary_site.steric_accessibility().max(0.2);
+                if let Some(dienophile) = profile.secondary_site.as_ref() {
+                    // Electron-poor dienophiles accelerate the normal-demand cycloaddition.
+                    if dienophile.electronics.electron_withdrawing_groups >= 1 {
+                        score.value *=
+                            1.0 + 0.4 * dienophile.electronics.electron_withdrawing_groups as f64;
+                        score.activation_delta -=
+                            3.0 * dienophile.electronics.electron_withdrawing_groups.min(3) as f64;
+                        score.reason =
+                            "electron-poor dienophile accelerates Diels-Alder".to_string();
+                    }
+                    score.value *= dienophile.steric_accessibility().max(0.2);
+                }
+                if context.is_high_temperature() {
+                    score.value *= 1.2;
+                    score.activation_delta -= 2.0;
+                }
+                score
+            }
+            ReactionType::RetroDielsAlder => {
+                let mut score = ReactivityScore::new(0.25, "thermal retro-Diels-Alder");
+                if context.is_high_temperature() {
+                    score.value *= 2.0;
+                    score.activation_delta -= 4.0;
+                }
+                if context.is_very_high_temperature() {
+                    score.value *= 3.0;
+                    score.activation_delta -= 7.0;
+                }
+                score
+            }
+            ReactionType::PhotochemicalIsomerization => {
+                let mut score =
+                    ReactivityScore::new(0.0, "double-bond photoisomerization needs light");
+                if context.total_light_power > TRACE_CONCENTRATION_MOL_PER_BUCKET
+                    || context.has_uv()
+                {
+                    score.value = 1.0 + context.total_light_power.max(context.uv_power).min(5.0);
+                    score.activation_delta =
+                        -3.0 * context.total_light_power.max(context.uv_power).min(3.0);
+                    score.reason = "light drives double-bond isomerization".to_string();
+                }
+                score
+            }
+            ReactionType::NAlkylation => evaluate_sn2(&profile.primary_site, context).primary,
+            ReactionType::RadicalHalogenation => evaluate_radical_halogenation(profile, context),
+            ReactionType::SkeletalRearrangement => {
+                evaluate_skeletal_rearrangement(profile, context)
             }
         };
         let recommendation = if matches!(profile.mechanism, ReactionType::SN2) {
@@ -253,6 +399,74 @@ impl SelectivityEngine {
     pub fn pre_exponential_multiplier(score: &ReactivityScore) -> f64 {
         score.pre_exp_multiplier
     }
+}
+
+fn evaluate_radical_halogenation(
+    profile: &SelectivityProfile,
+    context: &SelectivityContext,
+) -> ReactivityScore {
+    let mut value: f64 = 0.04;
+    let mut activation_delta = 12.0;
+    let mut reasons = Vec::new();
+
+    if context.has_uv() {
+        value *= 16.0 + context.uv_power.min(4.0) * 4.0;
+        activation_delta -= 18.0;
+        reasons.push("light initiates radical-chain halogenation");
+    }
+    if context.is_very_high_temperature() {
+        value *= 10.0;
+        activation_delta -= 14.0;
+        reasons.push("very high temperature thermally initiates radical halogenation");
+    } else if context.is_high_temperature() {
+        value *= 3.0;
+        activation_delta -= 6.0;
+        reasons.push("high temperature supports radical-chain propagation");
+    }
+    if context.is_oxygen_rich() {
+        value *= 0.35;
+        activation_delta += 7.0;
+        reasons.push("oxygen traps carbon radicals and suppresses halogenation");
+    }
+    if context.is_reducing() {
+        value *= 0.6;
+        activation_delta += 3.0;
+        reasons.push("reducing medium competes with halogen radical propagation");
+    }
+    if context.medium.is_supercritical() && matches!(context.solvent_type, SolventType::NonPolar) {
+        value *= 1.4;
+        activation_delta -= 2.0;
+        reasons.push("non-polar supercritical medium supports non-ionic radical propagation");
+    }
+    if profile.primary_site.electronics.resonance_stabilization {
+        value *= 2.0;
+        activation_delta -= 5.0;
+        reasons.push("resonance-stabilized radical center is favored");
+    }
+    match profile.primary_site.degree {
+        SubstitutionDegree::Tertiary => {
+            value *= 1.8;
+            activation_delta -= 4.0;
+            reasons.push("tertiary C-H abstraction is favored");
+        }
+        SubstitutionDegree::Secondary => {
+            value *= 1.3;
+            activation_delta -= 2.0;
+            reasons.push("secondary C-H abstraction is moderately favored");
+        }
+        SubstitutionDegree::Benzylic | SubstitutionDegree::Allylic => {
+            value *= 2.4;
+            activation_delta -= 6.0;
+            reasons.push("benzylic or allylic C-H abstraction is favored");
+        }
+        SubstitutionDegree::Primary => {}
+    }
+    if reasons.is_empty() {
+        reasons.push("radical halogenation lacks a strong initiation condition");
+    }
+
+    ReactivityScore::with_activation_delta(activation_delta, reasons.join("; "))
+        .with_pre_exp_multiplier(value.max(0.001))
 }
 
 fn apply_inorganic_environment_to_carbonyl_score(
@@ -601,6 +815,30 @@ impl SiteDescriptorBuilder {
         )
     }
 
+    pub(crate) fn from_amide_site(
+        site: &crate::chemistry::organic::centers::AmideSite,
+    ) -> SiteDescriptor {
+        descriptor_from_carbon(
+            site.participant.structure,
+            ReactiveSiteKind::Amide,
+            site.carbon,
+            site.participant.structure.carbon_degree(site.carbon),
+        )
+    }
+
+    pub(crate) fn from_unsaturated_bond_site(
+        site: &crate::chemistry::organic::centers::UnsaturatedBondSite,
+    ) -> SiteDescriptor {
+        descriptor_from_carbon(
+            site.participant.structure,
+            site.participant.site.kind.clone(),
+            site.high_degree_carbon,
+            site.participant
+                .structure
+                .carbon_degree(site.high_degree_carbon),
+        )
+    }
+
     /// Create descriptor from halide site
     pub(crate) fn from_halide_site(
         site: &crate::chemistry::organic::centers::HalideSite,
@@ -638,6 +876,23 @@ impl SiteDescriptorBuilder {
             ReactiveSiteKind::PhosphoniumSalt,
             site.alpha_carbon,
             site.participant.structure.carbon_degree(site.alpha_carbon),
+        )
+    }
+
+    pub(crate) fn from_thiol_site(
+        site: &crate::chemistry::organic::centers::ThiolSite,
+    ) -> SiteDescriptor {
+        let degree = match site.participant.structure.carbon_degree(site.sulfur) {
+            0 | 1 => SubstitutionDegree::Primary,
+            2 => SubstitutionDegree::Secondary,
+            _ => SubstitutionDegree::Tertiary,
+        };
+        SiteDescriptor::new(
+            ReactiveSiteKind::Thiol,
+            degree,
+            electronic_environment(site.participant.structure, site.sulfur),
+            bulky_substituent_count(site.participant.structure, site.sulfur),
+            has_beta_hydrogen(site.participant.structure, site.sulfur),
         )
     }
 
@@ -692,6 +947,43 @@ fn missing_secondary_site(profile: &SelectivityProfile) -> SelectivityRuntimeEff
             profile.mechanism
         ),
     }
+}
+
+fn evaluate_skeletal_rearrangement(
+    profile: &SelectivityProfile,
+    context: &SelectivityContext,
+) -> ReactivityScore {
+    let mut value: f64 = profile.primary_site.steric_accessibility().max(0.2);
+    let mut activation_delta = 0.0;
+    let mut reasons = Vec::new();
+
+    if context.is_acidic() {
+        value *= 1.8;
+        activation_delta -= 4.0;
+        reasons.push("acidic medium supports cationic or heteroatom-assisted migration");
+    } else {
+        value *= 0.35;
+        activation_delta += 10.0;
+        reasons.push("skeletal rearrangement lacks acid activation");
+    }
+    if context.is_high_temperature() {
+        value *= 1.4;
+        activation_delta -= 2.5;
+        reasons.push("heat helps overcome migration barrier");
+    }
+    if context.medium.is_supercritical() {
+        value *= 1.1;
+        activation_delta -= 0.8;
+        reasons.push("supercritical medium improves mass transport");
+    }
+    if profile.primary_site.electronics.resonance_stabilization {
+        value *= 1.25;
+        activation_delta -= 1.5;
+        reasons.push("migrating center is resonance-stabilized");
+    }
+
+    ReactivityScore::with_activation_delta(activation_delta, reasons.join("; "))
+        .with_pre_exp_multiplier(value.max(0.01))
 }
 
 fn evaluate_alpha_carbon_profile(
@@ -927,6 +1219,99 @@ fn evaluate_protecting_group_profile(
                 value *= 0.25;
                 activation_delta += 8.0;
                 reasons.push("dry medium suppresses ester hydrolysis");
+            }
+        }
+        ReactionType::AcylSubstitution => {
+            if context.is_acidic() || context.is_basic() {
+                value *= 1.4;
+                activation_delta -= 2.5;
+                reasons.push("acid or base catalyzes nucleophilic acyl substitution");
+            }
+            if context.is_water_rich() {
+                value *= 0.85;
+                activation_delta += 1.0;
+                reasons.push("water competes with organic acyl-transfer nucleophiles");
+            }
+            if matches!(
+                context.solvent_type,
+                crate::chemistry::selectivity::types::SolventType::AproticPolar
+                    | crate::chemistry::selectivity::types::SolventType::Basic
+            ) {
+                value *= 1.25;
+                activation_delta -= 1.5;
+                reasons.push("polar/basic medium supports nucleophilic acyl substitution");
+            }
+        }
+        _ => {}
+    }
+
+    ReactivityScore::with_activation_delta(activation_delta, reasons.join("; "))
+        .with_pre_exp_multiplier(value.max(0.01))
+}
+
+/// Medium/condition selectivity for ring-closing condensations. The ring-size
+/// strain term (Baldwin's rules) is applied separately by the generator via
+/// `ring_closure_activation_penalty_kj_per_mol`, because it depends on the
+/// concrete atoms being bonded rather than on the reaction medium.
+fn evaluate_cyclization_profile(
+    profile: &SelectivityProfile,
+    context: &SelectivityContext,
+) -> ReactivityScore {
+    let mut value: f64 = 1.0;
+    let mut activation_delta = 0.0;
+    let mut reasons = Vec::new();
+
+    match profile.mechanism {
+        ReactionType::Lactonization => {
+            if context.is_acidic() {
+                value *= 1.6;
+                activation_delta -= 3.0;
+                reasons.push("acid catalyzes lactonization");
+            }
+            if context.is_water_poor() {
+                value *= 1.8;
+                activation_delta -= 3.5;
+                reasons.push("dry medium drives the dehydrative ring closure");
+            } else {
+                value *= 0.3;
+                activation_delta += 9.0;
+                reasons.push("water reverses lactonization");
+            }
+        }
+        ReactionType::Lactamization => {
+            if context.is_high_temperature() {
+                value *= 1.5;
+                activation_delta -= 3.0;
+                reasons.push("heat drives amide ring closure");
+            }
+            if context.is_water_poor() {
+                value *= 1.6;
+                activation_delta -= 3.0;
+                reasons.push("dry medium favors lactam formation");
+            } else {
+                value *= 0.4;
+                activation_delta += 7.0;
+                reasons.push("water competes with lactam formation");
+            }
+        }
+        ReactionType::HeterocycleCondensation => {
+            if context.is_acidic() {
+                value *= 2.0;
+                activation_delta -= 4.0;
+                reasons.push("acid catalyzes the heterocyclic condensation");
+            } else {
+                value *= 0.2;
+                activation_delta += 12.0;
+                reasons.push("heterocyclic condensation lacks acid catalysis");
+            }
+            if context.is_water_poor() {
+                value *= 1.8;
+                activation_delta -= 3.5;
+                reasons.push("dry medium drives the dehydrative aromatization");
+            } else {
+                value *= 0.4;
+                activation_delta += 6.0;
+                reasons.push("water suppresses the dehydrative aromatization");
             }
         }
         _ => {}

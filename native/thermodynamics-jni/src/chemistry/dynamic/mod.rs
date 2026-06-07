@@ -81,7 +81,10 @@ enum OrganicGeneratorKind {
     AlkyneIodination,
     AromaticNitration,
     EpoxideHydrolysis,
+    OrganometallicFormation,
     OrganometallicCarbonylAddition,
+    OrganometallicNitrileAddition,
+    OrganometallicEpoxideOpening,
     AldolAddition,
     AlphaHalogenation,
     AldolDehydration,
@@ -102,11 +105,15 @@ enum OrganicGeneratorKind {
     AmineCbzProtection,
     CbzDeprotection,
     OrganicCombustion,
+    AlkeneEpoxidation,
+    RadicalHalogenation,
+    AlkenePhotoisomerization,
+    RetroDielsAlder,
 }
 
 impl OrganicGeneratorKind {
-    fn bit(self) -> u64 {
-        1_u64 << self.ordinal()
+    fn bit(self) -> u128 {
+        1_u128 << self.ordinal()
     }
 
     fn ordinal(self) -> u32 {
@@ -153,27 +160,34 @@ impl OrganicGeneratorKind {
             OrganicGeneratorKind::AlkyneIodination => 39,
             OrganicGeneratorKind::AromaticNitration => 40,
             OrganicGeneratorKind::EpoxideHydrolysis => 41,
-            OrganicGeneratorKind::OrganometallicCarbonylAddition => 42,
-            OrganicGeneratorKind::AldolAddition => 43,
-            OrganicGeneratorKind::AlphaHalogenation => 44,
-            OrganicGeneratorKind::AldolDehydration => 45,
-            OrganicGeneratorKind::EnamineFormation => 46,
-            OrganicGeneratorKind::EnolateAlkylation => 47,
-            OrganicGeneratorKind::MichaelAddition => 48,
-            OrganicGeneratorKind::ClaisenCondensation => 49,
-            OrganicGeneratorKind::PhosphoniumSaltFormation => 50,
-            OrganicGeneratorKind::PhosphoniumYlideFormation => 51,
-            OrganicGeneratorKind::WittigOlefination => 52,
-            OrganicGeneratorKind::HornerWadsworthEmmonsOlefination => 53,
-            OrganicGeneratorKind::JuliaOlefination => 54,
-            OrganicGeneratorKind::AlcoholSilylProtection => 55,
-            OrganicGeneratorKind::SilylEtherDeprotection => 56,
-            OrganicGeneratorKind::AcetalDeprotection => 57,
-            OrganicGeneratorKind::AmineBocProtection => 58,
-            OrganicGeneratorKind::BocDeprotection => 59,
-            OrganicGeneratorKind::AmineCbzProtection => 60,
-            OrganicGeneratorKind::CbzDeprotection => 61,
-            OrganicGeneratorKind::OrganicCombustion => 62,
+            OrganicGeneratorKind::OrganometallicFormation => 42,
+            OrganicGeneratorKind::OrganometallicCarbonylAddition => 43,
+            OrganicGeneratorKind::OrganometallicNitrileAddition => 44,
+            OrganicGeneratorKind::OrganometallicEpoxideOpening => 45,
+            OrganicGeneratorKind::AldolAddition => 46,
+            OrganicGeneratorKind::AlphaHalogenation => 47,
+            OrganicGeneratorKind::AldolDehydration => 48,
+            OrganicGeneratorKind::EnamineFormation => 49,
+            OrganicGeneratorKind::EnolateAlkylation => 50,
+            OrganicGeneratorKind::MichaelAddition => 51,
+            OrganicGeneratorKind::ClaisenCondensation => 52,
+            OrganicGeneratorKind::PhosphoniumSaltFormation => 53,
+            OrganicGeneratorKind::PhosphoniumYlideFormation => 54,
+            OrganicGeneratorKind::WittigOlefination => 55,
+            OrganicGeneratorKind::HornerWadsworthEmmonsOlefination => 56,
+            OrganicGeneratorKind::JuliaOlefination => 57,
+            OrganicGeneratorKind::AlcoholSilylProtection => 58,
+            OrganicGeneratorKind::SilylEtherDeprotection => 59,
+            OrganicGeneratorKind::AcetalDeprotection => 60,
+            OrganicGeneratorKind::AmineBocProtection => 61,
+            OrganicGeneratorKind::BocDeprotection => 62,
+            OrganicGeneratorKind::AmineCbzProtection => 63,
+            OrganicGeneratorKind::CbzDeprotection => 64,
+            OrganicGeneratorKind::OrganicCombustion => 65,
+            OrganicGeneratorKind::AlkeneEpoxidation => 66,
+            OrganicGeneratorKind::RadicalHalogenation => 67,
+            OrganicGeneratorKind::AlkenePhotoisomerization => 68,
+            OrganicGeneratorKind::RetroDielsAlder => 69,
         }
     }
 }
@@ -203,8 +217,9 @@ pub struct DynamicChemistryRegistry {
     canonical_by_id: BTreeMap<SubstanceId, String>,
     site_index: Vec<SiteBucket>,
     site_handles_by_substance: Vec<Vec<SiteHandle>>,
-    processed_generation_masks: BTreeMap<(usize, ReactiveSiteKey), u64>,
+    processed_generation_masks: BTreeMap<(usize, ReactiveSiteKey), u128>,
     processed_combustion_slots: BTreeSet<usize>,
+    processed_radical_slots: BTreeSet<usize>,
     dynamic_acid_base_specs: Vec<AcidBaseSpec>,
     dynamic_precipitation_specs: Vec<PrecipitationSpec>,
     dynamic_complex_specs: Vec<ComplexSpec>,
@@ -244,6 +259,7 @@ impl DynamicChemistryRegistry {
             site_handles_by_substance: vec![Vec::new(); static_substance_count],
             processed_generation_masks: BTreeMap::new(),
             processed_combustion_slots: BTreeSet::new(),
+            processed_radical_slots: BTreeSet::new(),
             dynamic_acid_base_specs: Vec::new(),
             dynamic_precipitation_specs: Vec::new(),
             dynamic_complex_specs: Vec::new(),
@@ -407,16 +423,7 @@ impl DynamicChemistryRegistry {
     ) -> ChemistryResult<DynamicGenerationReport> {
         self.substance(substance_id)?;
         let seeds = vec![self.known_substance_index_or_error(substance_id)?];
-        self.generate_reactions_from_scope(seeds, Some(max_iterations))
-    }
-
-    pub fn generate_reactions_for_to_fixed_point(
-        &mut self,
-        substance_id: &SubstanceId,
-    ) -> ChemistryResult<DynamicGenerationReport> {
-        self.substance(substance_id)?;
-        let seeds = vec![self.known_substance_index_or_error(substance_id)?];
-        self.generate_reactions_from_scope(seeds, None)
+        self.generate_reactions_from_scope(seeds, max_iterations)
     }
 
     pub fn generate_reactions_for_substances(
@@ -425,34 +432,22 @@ impl DynamicChemistryRegistry {
         max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
         let seeds = self.validated_substance_indices(substance_ids)?;
-        self.generate_reactions_from_scope(seeds, Some(max_iterations))
-    }
-
-    pub fn generate_reactions_for_substances_to_fixed_point(
-        &mut self,
-        substance_ids: impl IntoIterator<Item = SubstanceId>,
-    ) -> ChemistryResult<DynamicGenerationReport> {
-        let seeds = self.validated_substance_indices(substance_ids)?;
-        self.generate_reactions_from_scope(seeds, None)
+        self.generate_reactions_from_scope(seeds, max_iterations)
     }
 
     pub fn generate_reactions(
         &mut self,
         max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
-        self.generate_reactions_from_scope(self.all_known_substance_indices(), Some(max_iterations))
-    }
-
-    pub fn generate_to_fixed_point(&mut self) -> ChemistryResult<DynamicGenerationReport> {
-        self.generate_reactions_from_scope(self.all_known_substance_indices(), None)
+        self.generate_reactions_from_scope(self.all_known_substance_indices(), max_iterations)
     }
 
     fn generate_reactions_from_scope(
         &mut self,
         seeds: Vec<KnownSubstanceIndex>,
-        max_iterations: Option<usize>,
+        max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
-        if max_iterations == Some(0) {
+        if max_iterations == 0 {
             return Err(ChemistryError::InvalidReaction {
                 reaction_id: "<dynamic-generation>".to_string(),
                 reason: "max_iterations must be greater than zero".to_string(),
@@ -477,7 +472,7 @@ impl DynamicChemistryRegistry {
         }
         let mut iteration = 0usize;
         loop {
-            if max_iterations.is_some_and(|max| iteration >= max) {
+            if iteration >= max_iterations {
                 return Ok(DynamicGenerationReport {
                     iterations: iteration,
                     added_substances,
@@ -506,6 +501,7 @@ impl DynamicChemistryRegistry {
             let mut unprocessed_seeds = Vec::new();
             let mut pending_generation_mask_updates = Vec::new();
             let mut pending_combustion_slots = Vec::new();
+            let mut pending_radical_slots = Vec::new();
             for _ in 0..batch_len {
                 let seed = queue.pop_front().expect("batch length was measured");
                 self.mark_known_substance(&mut queued, seed, false);
@@ -515,13 +511,17 @@ impl DynamicChemistryRegistry {
                 }
                 let mask_updates = self.generation_mask_updates_for_substance(seed)?;
                 let combustion_slot = self.combustion_generation_update_for_substance(seed)?;
-                if mask_updates.is_empty() && combustion_slot.is_none() {
+                let radical_slot = self.radical_generation_update_for_substance(seed, &scope)?;
+                if mask_updates.is_empty() && combustion_slot.is_none() && radical_slot.is_none() {
                     skipped_duplicates += 1;
                     continue;
                 }
                 pending_generation_mask_updates.extend(mask_updates);
                 if let Some(slot) = combustion_slot {
                     pending_combustion_slots.push(slot);
+                }
+                if let Some(slot) = radical_slot {
+                    pending_radical_slots.push(slot);
                 }
                 unprocessed_seeds.push(seed);
                 processed_work_items += 1;
@@ -563,6 +563,7 @@ impl DynamicChemistryRegistry {
             let mut staged = self.clone();
             staged.apply_generation_mask_updates(&pending_generation_mask_updates);
             staged.apply_combustion_generation_updates(&pending_combustion_slots);
+            staged.apply_radical_generation_updates(&pending_radical_slots);
             let mut generated_id_remap = BTreeMap::new();
             let mut new_substance_ids = Vec::new();
             for substance in generated.substances {
@@ -571,15 +572,19 @@ impl DynamicChemistryRegistry {
                     continue;
                 }
                 let generated_id = substance.id.clone();
-                let canonical = substance
-                    .molecular_structure
-                    .as_ref()
-                    .map(write_frowns)
-                    .transpose()?
-                    .ok_or_else(|| ChemistryError::InvalidSubstance {
+                let canonical = if let Some(structure) = substance.molecular_structure.as_ref() {
+                    write_frowns(structure)?
+                } else if matches!(
+                    substance.representation,
+                    SubstanceRepresentation::Polymer { .. }
+                ) {
+                    format!("material:{}", substance.id.as_str())
+                } else {
+                    return Err(ChemistryError::InvalidSubstance {
                         substance_id: substance.id.to_string(),
-                        reason: "generated dynamic substance has no structure".to_string(),
-                    })?;
+                        reason: "generated molecular substance has no structure".to_string(),
+                    });
+                };
                 if let Some(existing) = staged.canonical_to_id.get(&canonical) {
                     generated_id_remap.insert(generated_id, existing.clone());
                     skipped_duplicates += 1;
@@ -1476,7 +1481,7 @@ impl DynamicChemistryRegistry {
     fn generation_mask_updates_for_substance(
         &self,
         substance_index: KnownSubstanceIndex,
-    ) -> ChemistryResult<Vec<(usize, ReactiveSiteKey, u64)>> {
+    ) -> ChemistryResult<Vec<(usize, ReactiveSiteKey, u128)>> {
         let site_keys = self.generation_site_keys_for_substance(substance_index)?;
         let slot = known_substance_slot(self.static_registry.substance_count(), substance_index);
         let mut updates = Vec::new();
@@ -1500,7 +1505,7 @@ impl DynamicChemistryRegistry {
         Ok(updates)
     }
 
-    fn apply_generation_mask_updates(&mut self, updates: &[(usize, ReactiveSiteKey, u64)]) {
+    fn apply_generation_mask_updates(&mut self, updates: &[(usize, ReactiveSiteKey, u128)]) {
         for (slot, site_key, mask) in updates {
             self.processed_generation_masks
                 .insert((*slot, site_key.clone()), *mask);
@@ -1523,6 +1528,38 @@ impl DynamicChemistryRegistry {
     fn apply_combustion_generation_updates(&mut self, slots: &[usize]) {
         self.processed_combustion_slots
             .extend(slots.iter().copied());
+    }
+
+    fn radical_generation_update_for_substance(
+        &self,
+        substance_index: KnownSubstanceIndex,
+        scope: &[bool],
+    ) -> ChemistryResult<Option<usize>> {
+        let _generator = OrganicGeneratorKind::RadicalHalogenation;
+        let substance = self.substance_by_known_index(substance_index)?;
+        if substance.molecular_structure.is_none() {
+            return Ok(None);
+        }
+        if !self.radical_halogen_available_in_scope(scope) {
+            return Ok(None);
+        }
+        let slot = known_substance_slot(self.static_registry.substance_count(), substance_index);
+        Ok((!self.processed_radical_slots.contains(&slot)).then_some(slot))
+    }
+
+    fn radical_halogen_available_in_scope(&self, scope: &[bool]) -> bool {
+        ["destroy:chlorine", "destroy:bromine"].iter().any(|id| {
+            self.known_substance_index(&SubstanceId::from(*id))
+                .map(|index| {
+                    let slot = known_substance_slot(self.static_registry.substance_count(), index);
+                    scope.get(slot).copied().unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn apply_radical_generation_updates(&mut self, slots: &[usize]) {
+        self.processed_radical_slots.extend(slots.iter().copied());
     }
 
     fn generation_site_keys_for_substance(
@@ -1566,6 +1603,15 @@ impl DynamicChemistryRegistry {
             self.canonical_to_id.clone(),
             &crate::chemistry::selectivity::types::SelectivityContext::default(),
         )
+        .map_err(|error| ChemistryError::GenerationInvariantViolation {
+            generator: "organic-dynamic-generation".to_string(),
+            substance_id: seed_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            reason: error.to_string(),
+        })
     }
 
     fn add_site_handles_for_substance(
@@ -1725,6 +1771,7 @@ fn generators_for_site(
             OrganicGeneratorKind::HalideCyanideSubstitution,
             OrganicGeneratorKind::HalideAmineSubstitution,
             OrganicGeneratorKind::EnolateAlkylation,
+            OrganicGeneratorKind::OrganometallicFormation,
         ],
         ReactiveSiteKind::Alcohol => &[
             OrganicGeneratorKind::AlcoholOxidation,
@@ -1743,6 +1790,7 @@ fn generators_for_site(
         ReactiveSiteKind::Nitrile => &[
             OrganicGeneratorKind::NitrileHydrolysis,
             OrganicGeneratorKind::NitrileHydrogenation,
+            OrganicGeneratorKind::OrganometallicNitrileAddition,
         ],
         ReactiveSiteKind::Nitro => &[OrganicGeneratorKind::NitroHydrogenation],
         ReactiveSiteKind::AcylChloride => &[
@@ -1802,7 +1850,10 @@ fn generators_for_site(
             OrganicGeneratorKind::AlkeneHydrogenation,
             OrganicGeneratorKind::AlkeneHydroiodination,
             OrganicGeneratorKind::AlkeneIodination,
+            OrganicGeneratorKind::AlkeneEpoxidation,
             OrganicGeneratorKind::MichaelAddition,
+            OrganicGeneratorKind::AlkenePhotoisomerization,
+            OrganicGeneratorKind::RetroDielsAlder,
         ],
         ReactiveSiteKind::Alkyne => &[
             OrganicGeneratorKind::AlkyneChlorination,
@@ -1815,12 +1866,19 @@ fn generators_for_site(
             OrganicGeneratorKind::AlkyneIodination,
         ],
         ReactiveSiteKind::AromaticRing => &[OrganicGeneratorKind::AromaticNitration],
-        ReactiveSiteKind::Epoxide => &[OrganicGeneratorKind::EpoxideHydrolysis],
+        ReactiveSiteKind::Epoxide => &[
+            OrganicGeneratorKind::EpoxideHydrolysis,
+            OrganicGeneratorKind::OrganometallicEpoxideOpening,
+        ],
         ReactiveSiteKind::Organomagnesium
         | ReactiveSiteKind::Organolithium
         | ReactiveSiteKind::Organocopper => {
             if roles.contains(&ReactiveRole::Nucleophile) {
-                &[OrganicGeneratorKind::OrganometallicCarbonylAddition]
+                &[
+                    OrganicGeneratorKind::OrganometallicCarbonylAddition,
+                    OrganicGeneratorKind::OrganometallicNitrileAddition,
+                    OrganicGeneratorKind::OrganometallicEpoxideOpening,
+                ]
             } else {
                 &[]
             }
@@ -2595,7 +2653,7 @@ mod tests {
     #[test]
     fn generation_tracking_uses_dense_generator_masks() {
         assert!(std::mem::size_of::<OrganicGeneratorKind>() <= 1);
-        assert!(OrganicGeneratorKind::AlkyneIodination.ordinal() < u64::BITS);
+        assert!(OrganicGeneratorKind::AlkeneEpoxidation.ordinal() < u128::BITS);
     }
 
     #[test]
@@ -2970,18 +3028,19 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_generation_can_run_to_fixed_point_without_iteration_limit() {
+    fn bounded_generation_terminates_and_seed_pass_is_idempotent() {
+        // Generation is always bounded by a step limit; there is no unbounded
+        // fixed-point mode. Growth reactions (e.g. dehydrogenative coupling) mean
+        // the reachable set from a hydrocarbon never converges, so a finite limit
+        // stops cleanly mid-expansion. Re-running from the same seed is idempotent:
+        // every generator already fired for the seed (its generation mask is
+        // saturated), so the second pass processes nothing and adds nothing.
+        const DEPTH: usize = 2;
         let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
         let methane = registry.resolve_frowns("C").unwrap();
-        let first = registry
-            .generate_reactions_for_to_fixed_point(&methane)
-            .unwrap();
-        let second = registry
-            .generate_reactions_for_to_fixed_point(&methane)
-            .unwrap();
+        let first = registry.generate_reactions_for(&methane, DEPTH).unwrap();
+        let second = registry.generate_reactions_for(&methane, DEPTH).unwrap();
 
-        assert!(first.reached_fixed_point);
-        assert_eq!(first.remaining_queue, 0);
         assert!(first.generator_errors.is_empty());
         assert!(first.added_reactions > 0);
         assert!(registry

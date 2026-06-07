@@ -29,6 +29,8 @@ pub mod mixture;
 pub mod molecule;
 #[path = "organic/mod.rs"]
 pub mod organic;
+#[path = "polymer/mod.rs"]
+pub mod polymer;
 #[path = "core/reaction.rs"]
 pub mod reaction;
 #[path = "data/reactions.rs"]
@@ -63,7 +65,11 @@ pub fn destroy_registry_builder() -> ChemistryResult<ChemistryRegistryBuilder> {
     let builder = catalog::destroy_substances_registry_builder()?;
     let builder = reactions::destroy_reactions_registry_builder(builder)?;
     let builder = reactions::destroy_metallurgy_reactions_registry_builder(builder)?;
-    Ok(builder.metallurgical_systems(metallurgy_data::default_metallurgical_systems()))
+    Ok(builder
+        .metallurgical_systems(metallurgy_data::default_metallurgical_systems())
+        .metallurgical_elements(metallurgy_data::default_metallurgical_element_data())
+        .metallurgical_pair_interactions(metallurgy_data::default_metallurgical_pair_interactions())
+        .metallurgical_compound_phases(metallurgy_data::default_metallurgical_compound_phases()))
 }
 
 pub fn destroy_registry_with_generated_reactions_builder(
@@ -1476,7 +1482,7 @@ mod tests {
             registry.reactions().count()
         );
         assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 155);
-        assert_eq!(DESTROY_METALLURGY_REACTION_COUNT, 28);
+        assert_eq!(DESTROY_METALLURGY_REACTION_COUNT, 46);
     }
 
     #[test]
@@ -1578,6 +1584,102 @@ mod tests {
             mixture.concentration_of(&oxide_ion)
                 <= super::mixture::TRACE_CONCENTRATION_MOL_PER_BUCKET
         );
+    }
+
+    #[test]
+    fn molten_metal_oxidation_moves_metal_into_slag() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let copper = SubstanceId::from("destroy:copper_metal");
+        let oxygen = SubstanceId::from("destroy:oxygen");
+        let copper_i_oxide = SubstanceId::from("destroy:copper_i_oxide");
+        let copper_oxide = SubstanceId::from("destroy:copper_ii_oxide");
+        let mut mixture = Mixture::new(1_500.0).unwrap();
+        mixture
+            .add_substance(&registry, copper.clone(), 1.0)
+            .unwrap();
+        mixture
+            .add_substance(&registry, oxygen.clone(), 0.05)
+            .unwrap();
+
+        assert!(react_for_tick(&registry, &mut mixture, 1).unwrap());
+        assert!(mixture.concentration_in_phase(&copper, MixturePhase::MoltenMetal) < 1.0);
+        assert!(mixture.concentration_in_phase(&oxygen, MixturePhase::Gas) < 0.05);
+        assert!(
+            mixture.concentration_of(&copper_i_oxide) + mixture.concentration_of(&copper_oxide)
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn carbon_monoxide_carburization_adds_dissolved_carbon_to_metal_phase() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let iron = SubstanceId::from("destroy:iron_metal");
+        let carbon_monoxide = SubstanceId::from("destroy:carbon_monoxide");
+        let dissolved_carbon = SubstanceId::from("destroy:dissolved_carbon");
+        let carbon_dioxide = SubstanceId::from("destroy:carbon_dioxide");
+        let mut mixture = Mixture::new(1_900.0).unwrap();
+        mixture.add_substance(&registry, iron, 1.0).unwrap();
+        mixture
+            .add_substance(&registry, carbon_monoxide.clone(), 0.4)
+            .unwrap();
+
+        assert!(react_for_tick(&registry, &mut mixture, 1).unwrap());
+        assert!(mixture.concentration_in_phase(&dissolved_carbon, MixturePhase::MoltenMetal) > 0.0);
+        assert!(mixture.concentration_in_phase(&carbon_dioxide, MixturePhase::Gas) > 0.0);
+        assert!(mixture.concentration_in_phase(&carbon_monoxide, MixturePhase::Gas) < 0.4);
+    }
+
+    #[test]
+    fn aluminum_deoxidation_moves_dissolved_oxygen_to_slag() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let iron = SubstanceId::from("destroy:iron_metal");
+        let aluminum = SubstanceId::from("destroy:aluminum_metal");
+        let oxygen = SubstanceId::from("destroy:dissolved_oxygen");
+        let alumina = SubstanceId::from("destroy:aluminum_oxide");
+        let mut mixture = Mixture::new(1_900.0).unwrap();
+        mixture.add_substance(&registry, iron, 1.0).unwrap();
+        mixture
+            .add_substance(&registry, aluminum.clone(), 0.1)
+            .unwrap();
+        mixture
+            .add_substance(&registry, oxygen.clone(), 0.2)
+            .unwrap();
+
+        assert!(react_for_tick(&registry, &mut mixture, 1).unwrap());
+        assert!(mixture.concentration_in_phase(&oxygen, MixturePhase::MoltenMetal) < 0.2);
+        assert!(mixture.concentration_in_phase(&aluminum, MixturePhase::MoltenMetal) < 0.1);
+        assert!(mixture.concentration_in_phase(&alumina, MixturePhase::MoltenSlag) > 0.0);
+    }
+
+    #[test]
+    fn basic_slag_removes_sulfur_and_phosphorus_from_molten_metal() {
+        let registry = destroy_registry_builder().unwrap().build().unwrap();
+        let iron = SubstanceId::from("destroy:iron_metal");
+        let lime = SubstanceId::from("destroy:calcium_oxide");
+        let sulfur = SubstanceId::from("destroy:dissolved_sulfur");
+        let phosphorus = SubstanceId::from("destroy:dissolved_phosphorus");
+        let oxygen = SubstanceId::from("destroy:dissolved_oxygen");
+        let calcium_sulfide = SubstanceId::from("destroy:calcium_sulfide");
+        let calcium_phosphate = SubstanceId::from("destroy:calcium_phosphate");
+        let mut mixture = Mixture::new(1_900.0).unwrap();
+        mixture.add_substance(&registry, iron, 1.0).unwrap();
+        mixture.add_substance(&registry, lime.clone(), 1.0).unwrap();
+        mixture
+            .add_substance(&registry, sulfur.clone(), 0.1)
+            .unwrap();
+        mixture
+            .add_substance(&registry, phosphorus.clone(), 0.1)
+            .unwrap();
+        mixture
+            .add_substance(&registry, oxygen.clone(), 0.5)
+            .unwrap();
+
+        assert!(react_for_tick(&registry, &mut mixture, 1).unwrap());
+        assert!(mixture.concentration_in_phase(&sulfur, MixturePhase::MoltenMetal) < 0.1);
+        assert!(mixture.concentration_in_phase(&phosphorus, MixturePhase::MoltenMetal) < 0.1);
+        assert!(mixture.concentration_in_phase(&lime, MixturePhase::MoltenSlag) < 1.0);
+        assert!(mixture.concentration_of(&calcium_sulfide) > 0.0);
+        assert!(mixture.concentration_of(&calcium_phosphate) > 0.0);
     }
 
     #[test]

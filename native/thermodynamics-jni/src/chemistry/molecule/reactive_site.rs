@@ -11,9 +11,11 @@ pub enum ReactiveSiteKind {
     Alcohol,
     Alkene,
     Alkoxide,
+    AlkylHydrogen,
     Alkyne,
     Aldehyde,
     Amide,
+    AmideNitrogen,
     AromaticCarbon,
     AromaticRing,
     ArylHalide,
@@ -39,6 +41,7 @@ pub enum ReactiveSiteKind {
     Organocopper,
     Organolithium,
     Organomagnesium,
+    Oxime,
     Phenol,
     PrimaryAmine,
     Phosphine,
@@ -310,11 +313,22 @@ pub fn try_find_reactive_sites(
             FunctionalGroupType::UnsubstitutedAmide => {
                 (ReactiveSiteKind::Amide, vec![ReactiveRole::Electrophile])
             }
+            FunctionalGroupType::SubstitutedAmide => {
+                (ReactiveSiteKind::Amide, vec![ReactiveRole::Electrophile])
+            }
+            FunctionalGroupType::AmideNitrogen => (
+                ReactiveSiteKind::AmideNitrogen,
+                vec![ReactiveRole::Nucleophile],
+            ),
             FunctionalGroupType::SilylEther => (ReactiveSiteKind::SilylEther, vec![]),
             FunctionalGroupType::Acetal => (ReactiveSiteKind::Acetal, vec![]),
             FunctionalGroupType::Ketal => (ReactiveSiteKind::Ketal, vec![]),
             FunctionalGroupType::BocCarbamate => (ReactiveSiteKind::BocCarbamate, vec![]),
             FunctionalGroupType::CbzCarbamate => (ReactiveSiteKind::CbzCarbamate, vec![]),
+            FunctionalGroupType::Oxime => (
+                ReactiveSiteKind::Oxime,
+                vec![ReactiveRole::Electrophile, ReactiveRole::LeavingGroup],
+            ),
         };
         sites.push(ReactiveSite::new(kind, group.atoms, roles));
     }
@@ -725,7 +739,8 @@ fn anchor_atoms_for_site(site: &ReactiveSite) -> Vec<usize> {
         | ReactiveSiteKind::Enol
         | ReactiveSiteKind::Organomagnesium
         | ReactiveSiteKind::Organolithium
-        | ReactiveSiteKind::Organocopper => site.atoms.iter().copied().take(2).collect(),
+        | ReactiveSiteKind::Organocopper
+        | ReactiveSiteKind::Oxime => site.atoms.iter().copied().take(2).collect(),
         ReactiveSiteKind::Epoxide => site.atoms.clone(),
         _ => site
             .primary_atom
