@@ -31,6 +31,8 @@ pub mod molecule;
 pub mod organic;
 #[path = "polymer/mod.rs"]
 pub mod polymer;
+#[path = "reactor/mod.rs"]
+pub mod reactor;
 #[path = "core/reaction.rs"]
 pub mod reaction;
 #[path = "data/reactions.rs"]
@@ -1476,12 +1478,12 @@ mod tests {
     fn destroy_reaction_catalog_builds() {
         let registry = destroy_registry_builder().unwrap().build().unwrap();
 
-        assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 118);
+        assert_eq!(DESTROY_EXPLICIT_REACTION_COUNT, 120);
         assert_eq!(
             DESTROY_REGISTERED_REACTION_COUNT + DESTROY_METALLURGY_REACTION_COUNT,
             registry.reactions().count()
         );
-        assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 155);
+        assert_eq!(DESTROY_REGISTERED_REACTION_COUNT, 157);
         assert_eq!(DESTROY_METALLURGY_REACTION_COUNT, 46);
     }
 

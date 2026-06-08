@@ -89,6 +89,9 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
+                if let Some(reaction) = generate_halide_dehydrohalogenation(&site, &mut resolver)? {
+                    push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
                 for metal in [
                     OrganometallicFormationMetal::Magnesium,
                     OrganometallicFormationMetal::Lithium,
@@ -106,6 +109,9 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
                 if let Some(reaction) = generate_alcohol_dehydration(&site, &mut resolver)? {
+                    push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
+                if let Some(reaction) = generate_keto_enol_tautomerization(&site, &mut resolver)? {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
                 let reaction = generate_thionyl_chloride_substitution(&site, &mut resolver)?;
@@ -340,6 +346,21 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 let reaction = generate_cbz_deprotection(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
+            ReactiveSiteKind::Sulfide => {
+                let site = participant.clone().sulfide_site()?;
+                if let Some(reaction) = generate_sulfide_oxidation_to_sulfoxide(&site, &mut resolver)?
+                {
+                    push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
+            }
+            ReactiveSiteKind::Sulfoxide => {
+                let site = participant.clone().sulfoxide_site()?;
+                if let Some(reaction) =
+                    generate_sulfoxide_oxidation_to_sulfone(&site, &mut resolver)?
+                {
+                    push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
+            }
             _ => {}
         }
 
@@ -429,6 +450,16 @@ pub(crate) fn generate_organic_reactions_for_seed_substances<'a>(
                     push_unique_reaction(&mut generated.reactions, &mut reaction_ids, reaction)?;
                 }
             }
+            // White phosphorus hydrolysis: P4 + OH⁻ + H2O → PH3 + hypophosphite
+            if substance.id.as_str() == "destroy:white_phosphorus" {
+                if let Some(reaction) = generate_p4_hydrolysis(substance, &mut resolver)? {
+                    push_unique_reaction(
+                        &mut generated.reactions,
+                        &mut reaction_ids,
+                        reaction,
+                    )?;
+                }
+            }
         }
     }
     generate_site_reactions_for_seed_participants(
@@ -465,6 +496,7 @@ fn is_generator_seed_site(kind: &ReactiveSiteKind) -> bool {
             | ReactiveSiteKind::Amide
             | ReactiveSiteKind::PrimaryAmine
             | ReactiveSiteKind::NonTertiaryAmine
+            | ReactiveSiteKind::NucleophilicPhosphorus
             | ReactiveSiteKind::Phosphine
             | ReactiveSiteKind::PhosphoniumSalt
             | ReactiveSiteKind::PhosphorusYlide
@@ -475,6 +507,8 @@ fn is_generator_seed_site(kind: &ReactiveSiteKind) -> bool {
             | ReactiveSiteKind::CbzCarbamate
             | ReactiveSiteKind::PhosphonateCarbanion
             | ReactiveSiteKind::SulfoneCarbanion
+            | ReactiveSiteKind::Sulfide
+            | ReactiveSiteKind::Sulfoxide
             | ReactiveSiteKind::Isocyanate
             | ReactiveSiteKind::Borane
             | ReactiveSiteKind::BorateEster
@@ -549,6 +583,18 @@ fn generate_pair_reactions_for_seed(
                 // Intramolecular closure to a lactone when the alcohol is on the
                 // same molecule (self-gated by substance id and ring size).
                 if let Some(reaction) = generate_lactonization(&acid_site, &alcohol_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+            // Condensation with a second carboxylic acid to an anhydride (incl.
+            // self-condensation to the symmetric anhydride). The generator folds
+            // the acid pair into a canonical order, so seeding from either acid
+            // yields one reaction that push_unique_reaction then collapses.
+            for other_acid in space.sites_of(&ReactiveSiteKind::CarboxylicAcid) {
+                let other_acid_site = other_acid.carboxylic_acid_site()?;
+                if let Some(reaction) =
+                    generate_acid_anhydride_formation(&acid_site, &other_acid_site, resolver)?
                 {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
@@ -761,6 +807,19 @@ fn generate_pair_reactions_for_seed(
                     &phosphine_site,
                     resolver,
                     context,
+                )? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+        }
+        ReactiveSiteKind::NucleophilicPhosphorus => {
+            let phosphorus_site = seed.clone().nucleophilic_phosphorus_site()?;
+            for halide in space.sites_of(&ReactiveSiteKind::Halide) {
+                let halide_site = halide.halide_site()?;
+                if let Some(reaction) = generate_nucleophilic_phosphorus_alkylation(
+                    &halide_site,
+                    &phosphorus_site,
+                    resolver,
                 )? {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
