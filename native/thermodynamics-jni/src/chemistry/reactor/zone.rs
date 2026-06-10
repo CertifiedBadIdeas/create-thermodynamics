@@ -50,6 +50,18 @@ impl ReactorZone {
         self.peripherals.iter().map(|p| p.uv_intensity()).sum()
     }
 
+    pub fn total_electrical_draw_w(&self) -> f64 {
+        self.peripherals.iter().map(|p| p.electrical_draw_w()).sum()
+    }
+
+    pub fn electrical_peripherals(&self) -> impl Iterator<Item = &Peripheral> {
+        self.peripherals.iter().filter(|p| p.is_electrical())
+    }
+
+    pub fn electrical_peripherals_mut(&mut self) -> impl Iterator<Item = &mut Peripheral> {
+        self.peripherals.iter_mut().filter(|p| p.is_electrical())
+    }
+
     pub fn mixture(&self) -> &Mixture {
         &self.mixture
     }
@@ -64,7 +76,7 @@ impl ReactorZone {
 
     pub fn set_volume_cubic_meters(&mut self, volume: f64) {
         self.volume_cubic_meters = volume;
-        self.mixture.set_gas_volume_cubic_meters(volume);
+        self.mixture.set_gas_volume_cubic_meters(volume).unwrap();
     }
 
     pub fn sealed(&self) -> bool {
@@ -91,7 +103,11 @@ impl ReactorZone {
         self.mixture.concentration_of(substance_id)
     }
 
-    pub fn tick(&mut self, registry: &crate::chemistry::registry::ChemistryRegistry, dt_seconds: f64) {
+    pub fn tick(
+        &mut self,
+        registry: &crate::chemistry::registry::ChemistryRegistry,
+        dt_seconds: f64,
+    ) {
         self.elapsed_seconds += dt_seconds;
         let mut peripherals = std::mem::take(&mut self.peripherals);
         for peripheral in &mut peripherals {

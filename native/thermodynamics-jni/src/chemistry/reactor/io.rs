@@ -37,7 +37,10 @@ pub fn mixture_snapshot(zone: &ReactorZone) -> MixtureSnapshot {
                 .filter_map(|&phase| {
                     let mol = mixture.concentration_in_phase(id, phase);
                     if mol > 0.0 {
-                        Some(PhaseAmount { phase, mol_per_bucket: mol })
+                        Some(PhaseAmount {
+                            phase,
+                            mol_per_bucket: mol,
+                        })
                     } else {
                         None
                     }
@@ -92,7 +95,7 @@ pub fn extract_from_phase(
     max_mol_per_bucket: f64,
 ) -> ChemistryResult<Vec<(SubstanceId, f64)>> {
     let snapshot = mixture_snapshot(zone);
-    let mut total_in_phase: f64 = snapshot
+    let total_in_phase: f64 = snapshot
         .substances
         .iter()
         .filter_map(|s| {
@@ -123,9 +126,18 @@ pub fn extract_from_phase(
         }
 
         let take = mol_in_phase * scale;
-        zone.mixture_mut()
-            .change_concentration(registry, &component.id, -take)?;
-        extracted.push((component.id.clone(), take));
+        let Some(substance_index) = registry.substance_index(&component.id) else {
+            continue;
+        };
+        let actual = zone.mixture_mut().extract_from_phase_by_index(
+            registry,
+            substance_index,
+            phase,
+            take,
+        )?;
+        if actual > 0.0 {
+            extracted.push((component.id.clone(), actual));
+        }
     }
 
     Ok(extracted)
@@ -142,8 +154,11 @@ pub fn extract_all(
         if component.total_mol_per_bucket <= 0.0 {
             continue;
         }
-        zone.mixture_mut()
-            .change_concentration(registry, &component.id, -component.total_mol_per_bucket)?;
+        zone.mixture_mut().change_concentration(
+            registry,
+            &component.id,
+            -component.total_mol_per_bucket,
+        )?;
         extracted.push((component.id.clone(), component.total_mol_per_bucket));
     }
 
