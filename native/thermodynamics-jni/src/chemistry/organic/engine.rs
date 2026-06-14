@@ -57,16 +57,25 @@ fn generate_organic_reactions_with_space(
             .map(|substance| substance.id.clone())
             .collect()
     });
-    generate_organic_reactions_for_seed_substances(space, &seed_ids, canonical_to_id, context)
+    let known_structures = known_structures_from_substances(space.all_substances.iter().copied());
+    generate_organic_reactions_for_seed_substances(
+        space,
+        &seed_ids,
+        canonical_to_id,
+        known_structures,
+        context,
+    )
 }
 
 pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
     space: &OrganicGenerationSpace<'a>,
     seed_participants: impl IntoIterator<Item = SiteParticipant<'a>>,
     canonical_to_id: BTreeMap<String, SubstanceId>,
+    known_structures: BTreeMap<SubstanceId, crate::chemistry::molecule::MolecularStructure>,
     context: &SelectivityContext,
 ) -> ChemistryResult<GeneratedOrganicCatalog> {
-    let mut resolver = DerivedSubstanceResolver::new_from_canonical_to_id(canonical_to_id);
+    let mut resolver =
+        DerivedSubstanceResolver::new_from_known_structures(canonical_to_id, known_structures);
     let mut reactions = Vec::new();
     let mut reaction_ids = BTreeSet::new();
 
@@ -140,6 +149,13 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 let site = participant.clone().oxime_site()?;
                 for reaction in generate_beckmann_rearrangements(&site, &mut resolver)? {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                }
+            }
+            ReactiveSiteKind::Hydrazone => {
+                if let Some(site) = participant.clone().try_aryl_hydrazone_center()? {
+                    for reaction in generate_hydrazone_aryl_annulation(&site, &mut resolver)? {
+                        push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                    }
                 }
             }
             ReactiveSiteKind::AcylChloride => {
@@ -260,6 +276,8 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
                 let site = participant.clone().isocyanate_site()?;
                 let reaction = generate_isocyanate_hydrolysis(&site, &mut resolver)?;
                 push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
+                let reaction = generate_isocyanate_ammonolysis(&site, &mut resolver)?;
+                push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
             }
             ReactiveSiteKind::Borane => {
                 let site = participant.clone().borane_site()?;
@@ -348,7 +366,8 @@ pub(crate) fn generate_organic_reactions_for_seed_participants<'a>(
             }
             ReactiveSiteKind::Sulfide => {
                 let site = participant.clone().sulfide_site()?;
-                if let Some(reaction) = generate_sulfide_oxidation_to_sulfoxide(&site, &mut resolver)?
+                if let Some(reaction) =
+                    generate_sulfide_oxidation_to_sulfoxide(&site, &mut resolver)?
                 {
                     push_unique_reaction(&mut reactions, &mut reaction_ids, reaction)?;
                 }
@@ -384,6 +403,7 @@ pub(crate) fn generate_organic_reactions_for_seed_substances<'a>(
     space: &OrganicGenerationSpace<'a>,
     seeds: &BTreeSet<SubstanceId>,
     canonical_to_id: BTreeMap<String, SubstanceId>,
+    known_structures: BTreeMap<SubstanceId, crate::chemistry::molecule::MolecularStructure>,
     context: &SelectivityContext,
 ) -> ChemistryResult<GeneratedOrganicCatalog> {
     let seed_participants = space
@@ -395,10 +415,19 @@ pub(crate) fn generate_organic_reactions_for_seed_substances<'a>(
         space,
         seed_participants,
         canonical_to_id,
+        known_structures,
         context,
     )?;
     let canonical_to_id = canonical_to_id_from_generated(space, &generated)?;
-    let mut resolver = DerivedSubstanceResolver::new_from_canonical_to_id(canonical_to_id);
+    let known_structures = known_structures_from_substances(
+        space
+            .all_substances
+            .iter()
+            .copied()
+            .chain(generated.substances.iter()),
+    );
+    let mut resolver =
+        DerivedSubstanceResolver::new_from_known_structures(canonical_to_id, known_structures);
     let mut reaction_ids = generated
         .reactions
         .iter()
@@ -453,11 +482,7 @@ pub(crate) fn generate_organic_reactions_for_seed_substances<'a>(
             // White phosphorus hydrolysis: P4 + OH⁻ + H2O → PH3 + hypophosphite
             if substance.id.as_str() == "destroy:white_phosphorus" {
                 if let Some(reaction) = generate_p4_hydrolysis(substance, &mut resolver)? {
-                    push_unique_reaction(
-                        &mut generated.reactions,
-                        &mut reaction_ids,
-                        reaction,
-                    )?;
+                    push_unique_reaction(&mut generated.reactions, &mut reaction_ids, reaction)?;
                 }
             }
         }
@@ -486,6 +511,7 @@ fn is_generator_seed_site(kind: &ReactiveSiteKind) -> bool {
             | ReactiveSiteKind::Nitrile
             | ReactiveSiteKind::Nitro
             | ReactiveSiteKind::Oxime
+            | ReactiveSiteKind::Hydrazone
             | ReactiveSiteKind::AcylChloride
             | ReactiveSiteKind::AcidAnhydride
             | ReactiveSiteKind::CarboxylicAcid
@@ -557,6 +583,20 @@ fn canonical_to_id_from_substances<'a>(
         }
     }
     Ok(canonical_to_id)
+}
+
+fn known_structures_from_substances<'a>(
+    substances: impl IntoIterator<Item = &'a Substance>,
+) -> BTreeMap<SubstanceId, crate::chemistry::molecule::MolecularStructure> {
+    let mut structures = BTreeMap::new();
+    for substance in substances {
+        if let Some(structure) = &substance.molecular_structure {
+            structures
+                .entry(substance.id.clone())
+                .or_insert_with(|| structure.clone());
+        }
+    }
+    structures
 }
 
 fn generate_pair_reactions_for_seed(
@@ -871,6 +911,44 @@ fn generate_pair_reactions_for_seed(
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
                 }
             }
+            for isocyanate in space.sites_of(&ReactiveSiteKind::Isocyanate) {
+                let isocyanate_site = isocyanate.isocyanate_site()?;
+                if let Some(reaction) =
+                    generate_isocyanate_amine_addition(&isocyanate_site, &amine_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+            for donor in space.sites_of(&ReactiveSiteKind::FormylationDonor) {
+                let donor_site = donor.formylation_donor_center()?;
+                if let Some(reaction) =
+                    generate_amine_formylation(&amine_site, &donor_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+        }
+        ReactiveSiteKind::Isocyanate => {
+            let isocyanate_site = seed.clone().isocyanate_site()?;
+            for amine in space.sites_of(&ReactiveSiteKind::NonTertiaryAmine) {
+                let amine_site = amine.amine_site()?;
+                if let Some(reaction) =
+                    generate_isocyanate_amine_addition(&isocyanate_site, &amine_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+        }
+        ReactiveSiteKind::FormylationDonor => {
+            let donor_site = seed.clone().formylation_donor_center()?;
+            for amine in space.sites_of(&ReactiveSiteKind::NonTertiaryAmine) {
+                let amine_site = amine.amine_site()?;
+                if let Some(reaction) =
+                    generate_amine_formylation(&amine_site, &donor_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
         }
         ReactiveSiteKind::Ester => {
             let ester_site = seed.clone().ester_site()?;
@@ -932,6 +1010,19 @@ fn generate_pair_reactions_for_seed(
                     generate_imine_formation(&carbonyl_site, &amine_site, resolver, context)?;
                 push_unique_reaction(reactions, reaction_ids, reaction)?;
             }
+            for bis_nucleophile in space.sites_of(&ReactiveSiteKind::BisNucleophile) {
+                let Some(nucleophile_site) = bis_nucleophile.try_bis_nucleophile_center()? else {
+                    continue;
+                };
+                if let Some(reaction) = generate_hydrazone_formation(
+                    &carbonyl_site,
+                    &nucleophile_site,
+                    resolver,
+                    context,
+                )? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
             for alpha in space
                 .sites_of(&ReactiveSiteKind::Enol)
                 .filter(|site| site.substance.id == carbonyl_site.participant.substance.id)
@@ -945,6 +1036,92 @@ fn generate_pair_reactions_for_seed(
                         &alpha_center,
                         resolver,
                     )? {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+            }
+            for dicarbonyl in space.sites_of(&ReactiveSiteKind::DicarbonylElectrophile) {
+                let dicarbonyl_center = dicarbonyl.dicarbonyl_electrophile_center()?;
+                for nucleophile_kind in
+                    [ReactiveSiteKind::BisNucleophile, ReactiveSiteKind::UreaLike]
+                {
+                    for nucleophile in space.sites_of(&nucleophile_kind) {
+                        let Some(nucleophile_site) = nucleophile.try_bis_nucleophile_center()?
+                        else {
+                            continue;
+                        };
+                        for reaction in generate_bis_nucleophile_dicarbonyl_condensation(
+                            &nucleophile_site,
+                            &dicarbonyl_center,
+                            resolver,
+                        )? {
+                            push_unique_reaction(reactions, reaction_ids, reaction)?;
+                        }
+                    }
+                }
+                let Some(activated) = dicarbonyl_center.activated_methylene_center() else {
+                    continue;
+                };
+                if let Some(reaction) =
+                    generate_knoevenagel_condensation(&activated, &carbonyl_site, resolver)?
+                {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+        }
+        ReactiveSiteKind::BisNucleophile | ReactiveSiteKind::UreaLike => {
+            let Some(nucleophile_site) = seed.clone().try_bis_nucleophile_center()? else {
+                return Ok(());
+            };
+            for dicarbonyl in space.sites_of(&ReactiveSiteKind::DicarbonylElectrophile) {
+                let dicarbonyl_site = dicarbonyl.dicarbonyl_electrophile_center()?;
+                for reaction in generate_bis_nucleophile_dicarbonyl_condensation(
+                    &nucleophile_site,
+                    &dicarbonyl_site,
+                    resolver,
+                )? {
+                    push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+            for carbonyl_kind in carbonyl_site_kinds() {
+                for carbonyl in space.sites_of(&carbonyl_kind) {
+                    let carbonyl_site = carbonyl.carbonyl_site()?;
+                    if let Some(reaction) = generate_hydrazone_formation(
+                        &carbonyl_site,
+                        &nucleophile_site,
+                        resolver,
+                        context,
+                    )? {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+            }
+        }
+        ReactiveSiteKind::DicarbonylElectrophile => {
+            let dicarbonyl_center = seed.clone().dicarbonyl_electrophile_center()?;
+            for nucleophile_kind in [ReactiveSiteKind::BisNucleophile, ReactiveSiteKind::UreaLike] {
+                for nucleophile in space.sites_of(&nucleophile_kind) {
+                    let Some(nucleophile_site) = nucleophile.try_bis_nucleophile_center()? else {
+                        continue;
+                    };
+                    for reaction in generate_bis_nucleophile_dicarbonyl_condensation(
+                        &nucleophile_site,
+                        &dicarbonyl_center,
+                        resolver,
+                    )? {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
+                }
+            }
+            let Some(activated) = dicarbonyl_center.activated_methylene_center() else {
+                return Ok(());
+            };
+            for carbonyl_kind in carbonyl_site_kinds() {
+                for carbonyl in space.sites_of(&carbonyl_kind) {
+                    let carbonyl_site = carbonyl.carbonyl_site()?;
+                    if let Some(reaction) =
+                        generate_knoevenagel_condensation(&activated, &carbonyl_site, resolver)?
+                    {
                         push_unique_reaction(reactions, reaction_ids, reaction)?;
                     }
                 }
@@ -1036,6 +1213,13 @@ fn generate_site_reactions_for_seed_participants<'a>(
                 let oxime_site = seed.clone().oxime_site()?;
                 for reaction in generate_beckmann_rearrangements(&oxime_site, resolver)? {
                     push_unique_reaction(reactions, reaction_ids, reaction)?;
+                }
+            }
+            ReactiveSiteKind::Hydrazone => {
+                if let Some(site) = seed.clone().try_aryl_hydrazone_center()? {
+                    for reaction in generate_hydrazone_aryl_annulation(&site, resolver)? {
+                        push_unique_reaction(reactions, reaction_ids, reaction)?;
+                    }
                 }
             }
             ReactiveSiteKind::Organomagnesium

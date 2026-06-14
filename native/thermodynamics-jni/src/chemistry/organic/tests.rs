@@ -66,6 +66,108 @@ const EXCLUDED_DESTROY_GENERIC_REACTIONS: &[&str] = &[
 const ACTIVE_GENERATORS_WITHOUT_CATALOG_SUBSTRATE: &[&str] = &["aldehyde_oxidation"];
 const ACTIVE_GENERATORS_WITH_UNKNOWN_STEREO_DISTRIBUTION: &[&str] = &[];
 
+const ORGANIC_MODEL_SOURCES: &[(&str, &str)] = &[
+    ("organic/engine.rs", include_str!("engine.rs")),
+    ("dynamic/mod.rs", include_str!("../dynamic/mod.rs")),
+    ("synthesis.rs", include_str!("../synthesis.rs")),
+    (
+        "generators/acid_derivatives.rs",
+        include_str!("generators/acid_derivatives.rs"),
+    ),
+    (
+        "generators/addition.rs",
+        include_str!("generators/addition.rs"),
+    ),
+    (
+        "generators/alcohol.rs",
+        include_str!("generators/alcohol.rs"),
+    ),
+    (
+        "generators/aromatic.rs",
+        include_str!("generators/aromatic.rs"),
+    ),
+    ("generators/boron.rs", include_str!("generators/boron.rs")),
+    (
+        "generators/c1_nitrogen.rs",
+        include_str!("generators/c1_nitrogen.rs"),
+    ),
+    (
+        "generators/carbonyl.rs",
+        include_str!("generators/carbonyl.rs"),
+    ),
+    (
+        "generators/combustion.rs",
+        include_str!("generators/combustion.rs"),
+    ),
+    (
+        "generators/cracking.rs",
+        include_str!("generators/cracking.rs"),
+    ),
+    (
+        "generators/cyclization.rs",
+        include_str!("generators/cyclization.rs"),
+    ),
+    (
+        "generators/enolate.rs",
+        include_str!("generators/enolate.rs"),
+    ),
+    (
+        "generators/heteroatom.rs",
+        include_str!("generators/heteroatom.rs"),
+    ),
+    (
+        "generators/heterocycle.rs",
+        include_str!("generators/heterocycle.rs"),
+    ),
+    (
+        "generators/organic_redox.rs",
+        include_str!("generators/organic_redox.rs"),
+    ),
+    (
+        "generators/organometallic.rs",
+        include_str!("generators/organometallic.rs"),
+    ),
+    (
+        "generators/phosphorus.rs",
+        include_str!("generators/phosphorus.rs"),
+    ),
+    (
+        "generators/polycondensation.rs",
+        include_str!("generators/polycondensation.rs"),
+    ),
+    (
+        "generators/protecting_groups.rs",
+        include_str!("generators/protecting_groups.rs"),
+    ),
+    (
+        "generators/radical.rs",
+        include_str!("generators/radical.rs"),
+    ),
+    (
+        "generators/rearrangement.rs",
+        include_str!("generators/rearrangement.rs"),
+    ),
+    (
+        "generators/ring_closure.rs",
+        include_str!("generators/ring_closure.rs"),
+    ),
+    (
+        "generators/substitution.rs",
+        include_str!("generators/substitution.rs"),
+    ),
+];
+
+const FORBIDDEN_TARGETED_ORGANIC_FRAGMENTS: &[&str] = &[
+    "generate_caffeine",
+    "generate_indole",
+    "generate_uracil",
+    "generate_xanthine",
+    "\"destroy:caffeine\"",
+    "\"destroy:indole\"",
+    "\"destroy:uracil\"",
+    "\"destroy:xanthine\"",
+];
+
 fn generated_registry() -> ChemistryRegistry {
     static REGISTRY: OnceLock<ChemistryRegistry> = OnceLock::new();
     REGISTRY
@@ -76,6 +178,18 @@ fn generated_registry() -> ChemistryRegistry {
                 .unwrap()
         })
         .clone()
+}
+
+#[test]
+fn organic_model_does_not_use_target_molecule_shortcuts() {
+    for (path, source) in ORGANIC_MODEL_SOURCES {
+        for forbidden in FORBIDDEN_TARGETED_ORGANIC_FRAGMENTS {
+            assert!(
+                !source.contains(forbidden),
+                "{path} contains targeted organic shortcut {forbidden}"
+            );
+        }
+    }
 }
 
 fn reaction_with_prefix<'a>(registry: &'a ChemistryRegistry, prefix: &str) -> &'a Reaction {
@@ -162,6 +276,105 @@ fn reactive_site_generators_add_aromatic_nitration_and_epoxide_hydrolysis() {
     assert!(dynamic
         .reactions()
         .any(|reaction| reaction.id.as_str().starts_with("epoxide_hydrolysis/")));
+}
+
+#[test]
+fn isocyanate_amine_addition_creates_urea_like_product() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let methyl_isocyanate = dynamic.resolve_frowns("CN=C=O").unwrap();
+    let methylamine = dynamic.resolve_frowns("CN").unwrap();
+
+    dynamic
+        .generate_reactions_for_substances([methyl_isocyanate.clone(), methylamine.clone()], 1)
+        .unwrap();
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("isocyanate_amine_addition/")
+        })
+        .expect("isocyanate and amine must add to a urea-like product");
+    let product_id = reaction
+        .products
+        .iter()
+        .find(|term| term.substance_id != methyl_isocyanate && term.substance_id != methylamine)
+        .expect("addition must create an organic product")
+        .substance_id
+        .clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(product_sites.contains(&ReactiveSiteKind::UreaLike));
+}
+
+#[test]
+fn isocyanate_ammonolysis_creates_urea_like_product() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let methyl_isocyanate = dynamic.resolve_frowns("CN=C=O").unwrap();
+
+    dynamic
+        .generate_reactions_for_substances([methyl_isocyanate.clone()], 1)
+        .unwrap();
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| reaction.id.as_str().starts_with("isocyanate_ammonolysis/"))
+        .expect("isocyanate must react with ammonia into a urea-like product");
+    assert!(reaction
+        .reactants
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:ammonia"));
+    let product_id = reaction.products[0].substance_id.clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(product_sites.contains(&ReactiveSiteKind::UreaLike));
+}
+
+#[test]
+fn amine_formylation_transfers_formyl_group_from_real_donor() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let methylamine = dynamic.resolve_frowns("CN").unwrap();
+    let formic_acid = dynamic.resolve_frowns("O=CO").unwrap();
+
+    dynamic
+        .generate_reactions_for_substances([methylamine.clone(), formic_acid.clone()], 1)
+        .unwrap();
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| reaction.id.as_str().starts_with("amine_formylation/"))
+        .expect("amine and formyl donor must form a formamide");
+    assert!(reaction
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:water"));
+    let product_id = reaction
+        .products
+        .iter()
+        .find(|term| term.substance_id.as_str() != "destroy:water")
+        .expect("formylation must create an organic product")
+        .substance_id
+        .clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(product_sites.contains(&ReactiveSiteKind::Amide));
 }
 
 #[test]
@@ -486,6 +699,264 @@ fn alpha_carbon_generators_create_halogenation_dehydration_enamine_and_alkylatio
                 .reactants
                 .iter()
                 .any(|term| term.substance_id == aldol_product)
+    }));
+}
+
+#[test]
+fn activated_methylene_condenses_with_carbonyl_to_alkene() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let malonaldehyde = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.C.C.O.H.H.H.H;\
+             bonds=0-d-1,0-s-2,2-s-3,3-d-4,0-s-5,2-s-6,2-s-7,3-s-8",
+        )
+        .unwrap();
+    let acetaldehyde = dynamic.resolve_frowns("CC=O").unwrap();
+
+    dynamic
+        .generate_reactions_for_substances([malonaldehyde.clone(), acetaldehyde.clone()], 1)
+        .unwrap();
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("knoevenagel_condensation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == malonaldehyde)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == acetaldehyde)
+        })
+        .expect("activated methylene and carbonyl must condense");
+    assert!(reaction
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:water"));
+    let product_id = reaction
+        .products
+        .iter()
+        .find(|term| term.substance_id.as_str() != "destroy:water")
+        .expect("condensation must create an organic product")
+        .substance_id
+        .clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(product_sites.contains(&ReactiveSiteKind::Alkene));
+}
+
+#[test]
+fn bis_nucleophile_and_dicarbonyl_condense_to_n_heterocycle() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let urea_like = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.N.N.H.H.H.H;\
+             bonds=0-d-1,0-s-2,0-s-3,2-s-4,2-s-5,3-s-6,3-s-7",
+        )
+        .unwrap();
+    let dicarbonyl = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.C.C.O.H.H.H.H;\
+             bonds=0-d-1,0-s-2,2-s-3,3-d-4,0-s-5,2-s-6,2-s-7,3-s-8",
+        )
+        .unwrap();
+    let urea_like_sites = try_find_reactive_sites(
+        dynamic
+            .substance(&urea_like)
+            .unwrap()
+            .molecular_structure
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|site| site.kind)
+    .collect::<Vec<_>>();
+    let dicarbonyl_sites = try_find_reactive_sites(
+        dynamic
+            .substance(&dicarbonyl)
+            .unwrap()
+            .molecular_structure
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|site| site.kind)
+    .collect::<Vec<_>>();
+    assert!(urea_like_sites.contains(&ReactiveSiteKind::UreaLike));
+    assert!(dicarbonyl_sites.contains(&ReactiveSiteKind::DicarbonylElectrophile));
+    let urea_substance = dynamic.substance(&urea_like).unwrap();
+    let urea_structure = urea_substance.molecular_structure.as_ref().unwrap();
+    let urea_site = try_find_reactive_sites(urea_structure)
+        .unwrap()
+        .into_iter()
+        .find(|site| site.kind == ReactiveSiteKind::UreaLike)
+        .unwrap();
+    let urea_center = SiteParticipant {
+        substance: urea_substance,
+        structure: urea_structure,
+        site: urea_site,
+    }
+    .bis_nucleophile_center()
+    .unwrap();
+    assert_eq!(urea_center.class, BisNucleophileClass::UreaLike);
+
+    let report = dynamic
+        .generate_reactions_for_substances([urea_like.clone(), dicarbonyl.clone()], 1)
+        .unwrap();
+    assert!(
+        report.generator_errors.is_empty(),
+        "generation errors: {:?}",
+        report.generator_errors
+    );
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("bis_nucleophile_dicarbonyl_condensation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == urea_like)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == dicarbonyl)
+        })
+        .expect("bis-nucleophile and activated 1,3-dicarbonyl must condense");
+    assert_eq!(
+        reaction
+            .products
+            .iter()
+            .filter(|term| term.substance_id.as_str() == "destroy:water")
+            .map(|term| term.coefficient)
+            .sum::<u32>(),
+        2
+    );
+    let product_id = reaction
+        .products
+        .iter()
+        .find(|term| term.substance_id.as_str() != "destroy:water")
+        .expect("condensation must create an organic product")
+        .substance_id
+        .clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(product_sites.contains(&ReactiveSiteKind::UreaLike));
+    assert!(product_sites.contains(&ReactiveSiteKind::Alkene));
+}
+
+#[test]
+fn guanidine_like_bis_nucleophile_uses_same_dicarbonyl_condensation() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let guanidine_like = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.N.N.N.H.H.H.H.H;\
+             bonds=0-d-1,0-s-2,0-s-3,1-s-4,2-s-5,2-s-6,3-s-7,3-s-8",
+        )
+        .unwrap();
+    let dicarbonyl = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.C.C.O.H.H.H.H;\
+             bonds=0-d-1,0-s-2,2-s-3,3-d-4,0-s-5,2-s-6,2-s-7,3-s-8",
+        )
+        .unwrap();
+
+    let report = dynamic
+        .generate_reactions_for_substances([guanidine_like.clone(), dicarbonyl.clone()], 1)
+        .unwrap();
+    assert!(
+        report.generator_errors.is_empty(),
+        "generation errors: {:?}",
+        report.generator_errors
+    );
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("bis_nucleophile_dicarbonyl_condensation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == guanidine_like)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == dicarbonyl)
+        })
+        .expect("guanidine-like and activated 1,3-dicarbonyl must condense");
+    assert_eq!(
+        reaction
+            .products
+            .iter()
+            .filter(|term| term.substance_id.as_str() == "destroy:water")
+            .map(|term| term.coefficient)
+            .sum::<u32>(),
+        2
+    );
+}
+
+#[test]
+fn bis_nucleophile_dicarbonyl_condensation_requires_explicit_bridge_hydrogens() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let urea_like = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.N.N.H.H.H.H;\
+             bonds=0-d-1,0-s-2,0-s-3,2-s-4,2-s-5,3-s-6,3-s-7",
+        )
+        .unwrap();
+    let substituted_dicarbonyl = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.O.C.C.O.H.H.C.H.H.H.H;\
+             bonds=0-d-1,0-s-2,2-s-3,3-d-4,0-s-5,2-s-6,2-s-7,7-s-8,7-s-9,7-s-10,3-s-11",
+        )
+        .unwrap();
+
+    let report = dynamic
+        .generate_reactions_for_substances([urea_like.clone(), substituted_dicarbonyl.clone()], 1)
+        .unwrap();
+    assert!(
+        report.generator_errors.is_empty(),
+        "generation errors: {:?}",
+        report.generator_errors
+    );
+    assert!(!dynamic.reactions().any(|reaction| {
+        reaction
+            .id
+            .as_str()
+            .starts_with("bis_nucleophile_dicarbonyl_condensation/")
+            && reaction
+                .reactants
+                .iter()
+                .any(|term| term.substance_id == urea_like)
+            && reaction
+                .reactants
+                .iter()
+                .any(|term| term.substance_id == substituted_dicarbonyl)
     }));
 }
 
@@ -2895,6 +3366,170 @@ fn amidine_cyclization_closes_xanthine_imidazole_onto_the_pyrimidinedione() {
     );
 
     dynamic.to_registry().unwrap();
+}
+
+#[test]
+fn carbonyl_and_hydrazine_like_bis_nucleophile_form_hydrazone() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let acetone = dynamic.resolve_frowns("CC(=O)C").unwrap();
+    let hydrazine = SubstanceId::from("destroy:hydrazine");
+    dynamic
+        .generate_reactions_for_substances([acetone.clone(), hydrazine], 1)
+        .unwrap();
+
+    let reaction = dynamic
+        .reactions()
+        .find(|reaction| reaction.id.as_str().starts_with("hydrazone_formation/"))
+        .expect("carbonyl plus hydrazine-like bis-nucleophile must form a hydrazone");
+    assert!(reaction
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:water"));
+
+    let product_id = reaction
+        .products
+        .iter()
+        .find(|term| term.substance_id.as_str() != "destroy:water")
+        .expect("hydrazone formation must have an organic product")
+        .substance_id
+        .clone();
+    let product = dynamic.substance(&product_id).unwrap();
+    let site_kinds = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|site| site.kind)
+        .collect::<Vec<_>>();
+    assert!(site_kinds.contains(&ReactiveSiteKind::Hydrazone));
+}
+
+#[test]
+fn aryl_hydrazone_annulates_through_explicit_ortho_and_sidechain_hydrogens() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let aryl_hydrazone = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.C.C.C.C.C.N.N.C.H.H.H.H.H.H.C.H.H.H.H;\
+             bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,\
+             0-s-6,6-s-7,7-d-8,1-s-9,2-s-10,3-s-11,4-s-12,5-s-13,6-s-14,\
+             8-s-15,8-s-16,15-s-17,15-s-18,15-s-19",
+        )
+        .unwrap();
+    let report = dynamic
+        .generate_reactions_for_substances([aryl_hydrazone.clone()], 1)
+        .unwrap();
+    assert!(
+        report.generator_errors.is_empty(),
+        "generation errors: {:?}",
+        report.generator_errors
+    );
+
+    let reactions = dynamic
+        .reactions()
+        .filter(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("hydrazone_aryl_annulation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == aryl_hydrazone)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reactions.len(), 2);
+    for reaction in reactions {
+        assert_eq!(
+            reaction
+                .selectivity_profile
+                .as_ref()
+                .map(|profile| profile.mechanism),
+            Some(crate::chemistry::selectivity::types::ReactionType::HeterocycleCondensation)
+        );
+        assert!(reaction
+            .products
+            .iter()
+            .any(|term| term.substance_id.as_str() == "destroy:ammonia"));
+        assert!(reaction
+            .conditions
+            .iter()
+            .any(|condition| condition.reason.contains("aryl hydrazone annulation")));
+        let product_id = reaction
+            .products
+            .iter()
+            .find(|term| term.substance_id.as_str() != "destroy:ammonia")
+            .expect("annulation must create an organic product")
+            .substance_id
+            .clone();
+        let product = dynamic.substance(&product_id).unwrap();
+        let product_sites = try_find_reactive_sites(product.molecular_structure.as_ref().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|site| site.kind)
+            .collect::<Vec<_>>();
+        assert!(product_sites.contains(&ReactiveSiteKind::AromaticRing));
+        assert!(!product_sites.contains(&ReactiveSiteKind::Hydrazone));
+    }
+}
+
+#[test]
+fn blocked_ortho_aryl_hydrazone_annulates_only_at_free_ortho_site() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let aryl_hydrazone = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.C.C.C.C.C.N.N.C.C.H.H.H.H.H.C.H.H.H.H.H.H.H;\
+             bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,\
+             0-s-6,6-s-7,7-d-8,1-s-9,2-s-10,3-s-11,4-s-12,5-s-13,6-s-14,\
+             8-s-15,8-s-16,9-s-17,9-s-18,9-s-19,15-s-20,15-s-21,15-s-22",
+        )
+        .unwrap();
+    dynamic
+        .generate_reactions_for_substances([aryl_hydrazone.clone()], 1)
+        .unwrap();
+
+    let reactions = dynamic
+        .reactions()
+        .filter(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("hydrazone_aryl_annulation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == aryl_hydrazone)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reactions.len(), 1);
+}
+
+#[test]
+fn aryl_hydrazone_annulation_requires_carbon_sidechain_hydrogens() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let aryl_formaldehyde_hydrazone = dynamic
+        .resolve_frowns(
+            "destroy:graph:atoms=C.C.C.C.C.C.N.N.C.H.H.H.H.H.H.H.H;\
+             bonds=0-a-1,1-a-2,2-a-3,3-a-4,4-a-5,5-a-0,\
+             0-s-6,6-s-7,7-d-8,\
+             1-s-9,2-s-10,3-s-11,4-s-12,5-s-13,6-s-14,8-s-15,8-s-16",
+        )
+        .unwrap();
+    dynamic
+        .generate_reactions_for_substances([aryl_formaldehyde_hydrazone.clone()], 1)
+        .unwrap();
+
+    assert!(!dynamic.reactions().any(|reaction| {
+        reaction
+            .id
+            .as_str()
+            .starts_with("hydrazone_aryl_annulation/")
+            && reaction
+                .reactants
+                .iter()
+                .any(|term| term.substance_id == aryl_formaldehyde_hydrazone)
+    }));
 }
 
 /// Uracil: pyrimidine-2,4-dione. Ring N1 sits between C2=O and C6... (N1 is bonded
