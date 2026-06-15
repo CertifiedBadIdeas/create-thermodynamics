@@ -7,7 +7,8 @@
 //! Cbz amine protection.
 
 use super::super::centers::{
-    AcetalCenter, AlcoholSite, AmineSite, BocCarbamateCenter, CbzCarbamateCenter, SilylEtherCenter,
+    AcetalCenter, AlcoholSite, AmineSite, BocCarbamateCenter, CbzCarbamateCenter,
+    ChloroformateSite, SilylEtherCenter,
 };
 use super::super::resolver::DerivedSubstanceResolver;
 use super::common::*;
@@ -19,6 +20,7 @@ use crate::chemistry::selectivity::{
     engine::SiteDescriptorBuilder,
     types::{ReactionType, SelectivityProfile},
 };
+use crate::chemistry::substance::SubstanceId;
 
 /// Add TMS (trimethylsilyl) protecting group to an alcohol
 ///
@@ -74,6 +76,210 @@ pub(crate) fn generate_alcohol_silyl_protection(
     .build())
 }
 
+pub(crate) fn generate_alcohol_chloroformate_formation(
+    alcohol_site: &AlcoholSite<'_>,
+    resolver: &mut DerivedSubstanceResolver,
+) -> ChemistryResult<Reaction> {
+    let alcohol = alcohol_site.participant.substance;
+    let phosgene_id = SubstanceId::from("destroy:phosgene");
+    let phosgene =
+        resolver
+            .known_structure(&phosgene_id)
+            .ok_or_else(|| ChemistryError::InvalidReaction {
+                reaction_id: generated_site_reaction_id(
+                    "alcohol_chloroformate_formation",
+                    &alcohol_site.participant,
+                ),
+                reason: "required reagent 'destroy:phosgene' has no known molecular structure"
+                    .to_string(),
+            })?;
+    let (phosgene_carbon, _phosgene_oxygen, leaving_chlorine) =
+        phosgene_chloroformate_atoms(phosgene)?;
+
+    let mut alcohol_editor = MolecularEditor::new(alcohol_site.participant.structure);
+    let alcohol_mapping = alcohol_editor.remove_atoms(&[alcohol_site.hydrogen])?;
+    let alcohol_oxygen = mapped_atom(&alcohol_mapping, alcohol_site.oxygen, "alcohol oxygen")?;
+    let alcohol_fragment = alcohol_editor.finish()?;
+
+    let mut phosgene_editor = MolecularEditor::new(phosgene);
+    let phosgene_mapping = phosgene_editor.remove_atoms(&[leaving_chlorine])?;
+    let phosgene_carbon = mapped_atom(
+        &phosgene_mapping,
+        phosgene_carbon,
+        "phosgene carbonyl carbon",
+    )?;
+    let phosgene_fragment = phosgene_editor.finish()?;
+
+    let product = resolver.resolve(MolecularEditor::join_structures(
+        &alcohol_fragment,
+        alcohol_oxygen,
+        &phosgene_fragment,
+        phosgene_carbon,
+        1.0,
+    )?)?;
+
+    Ok(Reaction::builder(generated_site_reaction_id(
+        "alcohol_chloroformate_formation",
+        &alcohol_site.participant,
+    ))
+    .reactant(alcohol.id.clone(), 1, 1)
+    .reactant(phosgene_id, 1, 1)
+    .product(product, 1)
+    .product("destroy:hydrochloric_acid", 1)
+    .condition(
+        ReactionCondition::new("chloroformate formation requires dry alcoholysis of phosgene")
+            .max_water_activity(0.05),
+    )
+    .activation_energy_kj_per_mol(18.0)
+    .selectivity_profile(
+        SelectivityProfile::new(
+            ReactionType::AcylSubstitution,
+            SiteDescriptorBuilder::from_alcohol_site(alcohol_site),
+        )
+        .never_suppress(),
+    )
+    .build())
+}
+
+fn phosgene_chloroformate_atoms(
+    structure: &MolecularStructure,
+) -> ChemistryResult<(usize, usize, usize)> {
+    for carbon in 0..structure.atoms.len() {
+        if structure.atoms[carbon].element != "C" {
+            continue;
+        }
+        let mut oxygen = None;
+        let mut chlorines = Vec::new();
+        for (neighbor, order) in structure.neighbors(carbon) {
+            if structure.atoms[neighbor].element == "O" && bond_order_matches(order, 2.0) {
+                oxygen = Some(neighbor);
+            }
+            if structure.atoms[neighbor].element == "Cl" && bond_order_matches(order, 1.0) {
+                chlorines.push(neighbor);
+            }
+        }
+        if let (Some(oxygen), Some(chlorine)) = (oxygen, chlorines.first().copied()) {
+            if chlorines.len() == 2 {
+                return Ok((carbon, oxygen, chlorine));
+            }
+        }
+    }
+    Err(ChemistryError::InvalidReaction {
+        reaction_id: "alcohol_chloroformate_formation".to_string(),
+        reason: "phosgene structure must contain C(=O)Cl2".to_string(),
+    })
+}
+
+pub(crate) fn generate_chloroformate_alcohol_carbonate_formation(
+    chloroformate: &ChloroformateSite<'_>,
+    alcohol: &AlcoholSite<'_>,
+    resolver: &mut DerivedSubstanceResolver,
+) -> ChemistryResult<Reaction> {
+    generate_chloroformate_transfer(
+        chloroformate,
+        alcohol.participant.structure,
+        alcohol.oxygen,
+        alcohol.hydrogen,
+        &alcohol.participant,
+        "chloroformate_alcohol_carbonate_formation",
+        ReactionType::AcylSubstitution,
+        SiteDescriptorBuilder::from_alcohol_site(alcohol),
+        resolver,
+    )
+}
+
+pub(crate) fn generate_chloroformate_amine_carbamate_formation(
+    chloroformate: &ChloroformateSite<'_>,
+    amine: &AmineSite<'_>,
+    resolver: &mut DerivedSubstanceResolver,
+) -> ChemistryResult<Option<Reaction>> {
+    let Some(&hydrogen) = amine.hydrogens.first() else {
+        return Ok(None);
+    };
+    Ok(Some(generate_chloroformate_transfer(
+        chloroformate,
+        amine.participant.structure,
+        amine.nitrogen,
+        hydrogen,
+        &amine.participant,
+        "chloroformate_amine_carbamate_formation",
+        ReactionType::AcylSubstitution,
+        SiteDescriptorBuilder::from_amine_site(amine),
+        resolver,
+    )?))
+}
+
+fn generate_chloroformate_transfer(
+    chloroformate: &ChloroformateSite<'_>,
+    nucleophile_structure: &MolecularStructure,
+    nucleophile_atom: usize,
+    nucleophile_hydrogen: usize,
+    nucleophile_participant: &crate::chemistry::organic::space::SiteParticipant<'_>,
+    prefix: &'static str,
+    reaction_type: ReactionType,
+    nucleophile_descriptor: crate::chemistry::selectivity::types::SiteDescriptor,
+    resolver: &mut DerivedSubstanceResolver,
+) -> ChemistryResult<Reaction> {
+    let mut donor_editor = MolecularEditor::new(chloroformate.participant.structure);
+    let donor_mapping = donor_editor.remove_atoms(&[chloroformate.chlorine])?;
+    let carbon = mapped_atom(
+        &donor_mapping,
+        chloroformate.carbon,
+        "chloroformate carbonyl carbon",
+    )?;
+    let donor_fragment = donor_editor.finish()?;
+
+    let mut nucleophile_editor = MolecularEditor::new(nucleophile_structure);
+    let nucleophile_mapping = nucleophile_editor.remove_atoms(&[nucleophile_hydrogen])?;
+    let nucleophile_atom = mapped_atom(
+        &nucleophile_mapping,
+        nucleophile_atom,
+        "chloroformate nucleophile atom",
+    )?;
+    let nucleophile_fragment = nucleophile_editor.finish()?;
+
+    let product = resolver.resolve(MolecularEditor::join_structures(
+        &donor_fragment,
+        carbon,
+        &nucleophile_fragment,
+        nucleophile_atom,
+        1.0,
+    )?)?;
+
+    Ok(Reaction::builder(generated_pair_site_reaction_id(
+        prefix,
+        &chloroformate.participant,
+        nucleophile_participant,
+    ))
+    .reactant(chloroformate.participant.substance.id.clone(), 1, 1)
+    .reactant(nucleophile_participant.substance.id.clone(), 1, 1)
+    .product(product, 1)
+    .product("destroy:hydrochloric_acid", 1)
+    .condition(
+        ReactionCondition::new("chloroformate transfer is suppressed by wet media")
+            .max_water_activity(0.2),
+    )
+    .activation_energy_kj_per_mol(16.0)
+    .selectivity_profile(
+        SelectivityProfile::new(
+            reaction_type,
+            SiteDescriptorBuilder::build(
+                crate::chemistry::reactive_site::ReactiveSiteKind::Chloroformate,
+                crate::chemistry::selectivity::types::SubstitutionDegree::Primary,
+                0,
+                0,
+                0,
+                false,
+                false,
+                false,
+            ),
+        )
+        .with_secondary_site(nucleophile_descriptor)
+        .never_suppress(),
+    )
+    .build())
+}
+
 /// Remove TMS protecting group from a silyl ether
 ///
 /// Reaction: R-OSiMe3 + F- + H+ -> R-OH + Me3SiF
@@ -81,58 +287,51 @@ pub(crate) fn generate_alcohol_silyl_protection(
 pub(crate) fn generate_silyl_ether_deprotection(
     silyl_site: &SilylEtherCenter<'_>,
     resolver: &mut DerivedSubstanceResolver,
-) -> ChemistryResult<Reaction> {
+) -> ChemistryResult<Option<Reaction>> {
     let substance = silyl_site.participant.substance;
     let structure = silyl_site.participant.structure;
     let oxygen = silyl_site.oxygen;
     let silicon = silyl_site.silicon;
 
-    // Find and remove the silicon with its three methyl groups
+    let Some(mut atoms_to_remove) = trimethylsilyl_fragment_atoms(structure, oxygen, silicon)
+    else {
+        return Ok(None);
+    };
+    atoms_to_remove.push(silicon);
+    atoms_to_remove.sort_unstable();
+    atoms_to_remove.dedup();
+
     let mut editor = MolecularEditor::new(structure);
-
-    // Collect atoms to remove: silicon and its methyl groups
-    let mut atoms_to_remove = vec![silicon];
-    for (neighbor, order) in structure.neighbors(silicon) {
-        if structure.atoms[neighbor].element == "C" && bond_order_matches(order, 1.0) {
-            atoms_to_remove.push(neighbor);
-            // Also remove hydrogens on these methyl carbons
-            for (h_neighbor, h_order) in structure.neighbors(neighbor) {
-                if structure.atoms[h_neighbor].element == "H" && bond_order_matches(h_order, 1.0) {
-                    atoms_to_remove.push(h_neighbor);
-                }
-            }
-        }
-    }
-
     let mapping = editor.remove_atoms(&atoms_to_remove)?;
     let oxygen = mapped_atom(&mapping, oxygen, "silyl ether oxygen")?;
 
-    // Add hydrogen to the oxygen
     editor.add_atom(oxygen, "H", 0.0, 1.0)?;
 
     let product = resolver.resolve(editor.finish()?)?;
 
-    Ok(Reaction::builder(generated_site_reaction_id(
-        "silyl_ether_deprotection",
-        &silyl_site.participant,
-    ))
-    .reactant(substance.id.clone(), 1, 1)
-    .reactant("destroy:fluoride", 1, 1) // F- from TBAF or similar
-    .reactant("destroy:proton", 1, 1)
-    .product(product, 1)
-    .product("destroy:trimethylsilyl_fluoride", 1)
-    .condition(ReactionCondition::new(
-        "fluoride deprotection requires fluoride source",
-    ))
-    .selectivity_profile(
-        SelectivityProfile::new(
-            ReactionType::SilylEtherCleavage,
-            SiteDescriptorBuilder::silyl_ether(),
+    Ok(Some(
+        Reaction::builder(generated_site_reaction_id(
+            "silyl_ether_deprotection",
+            &silyl_site.participant,
+        ))
+        .reactant(substance.id.clone(), 1, 1)
+        .reactant("destroy:fluoride", 1, 1) // F- from TBAF or similar
+        .reactant("destroy:proton", 1, 1)
+        .product(product, 1)
+        .product("destroy:trimethylsilyl_fluoride", 1)
+        .condition(ReactionCondition::new(
+            "fluoride deprotection requires fluoride source",
+        ))
+        .selectivity_profile(
+            SelectivityProfile::new(
+                ReactionType::SilylEtherCleavage,
+                SiteDescriptorBuilder::silyl_ether(),
+            )
+            .never_suppress(),
         )
-        .never_suppress(),
-    )
-    .activation_energy_kj_per_mol(20.0)
-    .build())
+        .activation_energy_kj_per_mol(20.0)
+        .build(),
+    ))
 }
 
 /// Hydrolyze an acetal or ketal back to the carbonyl compound and concrete alcohols.
@@ -440,6 +639,47 @@ fn add_cbz_group(editor: &mut MolecularEditor, nitrogen: usize) -> ChemistryResu
         editor.add_atom(*carbon, "H", 0.0, 1.0)?;
     }
     Ok(())
+}
+
+fn trimethylsilyl_fragment_atoms(
+    structure: &MolecularStructure,
+    protected_oxygen: usize,
+    silicon: usize,
+) -> Option<Vec<usize>> {
+    let substituents = structure
+        .neighbors(silicon)
+        .into_iter()
+        .filter(|(neighbor, order)| {
+            *neighbor != protected_oxygen && bond_order_matches(*order, 1.0)
+        })
+        .collect::<Vec<_>>();
+    if substituents.len() != 3 {
+        return None;
+    }
+
+    let mut atoms = Vec::new();
+    for (carbon, _) in substituents {
+        if structure.atoms[carbon].element != "C" {
+            return None;
+        }
+        let mut hydrogens = Vec::new();
+        for (neighbor, order) in structure.neighbors(carbon) {
+            if neighbor == silicon {
+                continue;
+            }
+            if structure.atoms[neighbor].element == "H" && bond_order_matches(order, 1.0) {
+                hydrogens.push(neighbor);
+            } else {
+                return None;
+            }
+        }
+        if hydrogens.len() != 3 {
+            return None;
+        }
+        atoms.push(carbon);
+        atoms.extend(hydrogens);
+    }
+    Some(atoms)
 }
 
 fn branch_atoms(

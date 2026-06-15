@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::dynamic::DynamicChemistryRegistry;
 use super::error::{ChemistryError, ChemistryResult};
@@ -58,6 +58,36 @@ pub struct SynthesisPlanReport {
     pub unsupported_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthesisReachabilityRequest {
+    pub targets: Vec<SubstanceId>,
+    pub available_substances: BTreeSet<SubstanceId>,
+    pub generation_iterations: usize,
+    pub max_steps: usize,
+    pub max_routes_per_target: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthesisReachabilityReport {
+    pub starting_substance_count: usize,
+    pub target_count: usize,
+    pub reachable_targets: Vec<SubstanceId>,
+    pub unreachable_targets: Vec<SubstanceId>,
+    pub target_reports: Vec<SynthesisTargetReachability>,
+    pub generation_report: super::dynamic::DynamicGenerationReport,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthesisTargetReachability {
+    pub target: SubstanceId,
+    pub status: SynthesisPlanStatus,
+    pub has_known_producer: bool,
+    pub producer_reactions: Vec<ReactionId>,
+    pub missing_reactants: Vec<SynthesisRequirement>,
+    pub routes: Vec<SynthesisRoute>,
+    pub unsupported_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SynthesisPlanStatus {
     TargetAlreadyAvailable,
@@ -106,10 +136,23 @@ pub struct SynthesisConditionHint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct FrontierState {
-    known: BTreeSet<SubstanceId>,
-    steps: Vec<SynthesisStep>,
+struct ProductPlan {
+    step: SynthesisStep,
     estimated_yield: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SynthesisReactionIndex {
+    producers_by_product: BTreeMap<SubstanceId, Vec<ReactionId>>,
+}
+
+impl SynthesisReactionIndex {
+    fn producers(&self, product: &SubstanceId) -> &[ReactionId] {
+        self.producers_by_product
+            .get(product)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 impl Default for SynthesisPlanner {
@@ -172,6 +215,46 @@ impl SynthesisRequest {
 
     pub fn with_max_routes(mut self, max_routes: usize) -> Self {
         self.max_routes = Some(max_routes);
+        self
+    }
+}
+
+impl SynthesisReachabilityRequest {
+    pub fn new(targets: impl IntoIterator<Item = SubstanceId>) -> Self {
+        Self {
+            targets: targets.into_iter().collect(),
+            available_substances: BTreeSet::new(),
+            generation_iterations: 3,
+            max_steps: 6,
+            max_routes_per_target: 3,
+        }
+    }
+
+    pub fn with_available_substance(mut self, substance_id: impl Into<SubstanceId>) -> Self {
+        self.available_substances.insert(substance_id.into());
+        self
+    }
+
+    pub fn with_available_substances<I>(mut self, substance_ids: I) -> Self
+    where
+        I: IntoIterator<Item = SubstanceId>,
+    {
+        self.available_substances.extend(substance_ids);
+        self
+    }
+
+    pub fn with_generation_iterations(mut self, generation_iterations: usize) -> Self {
+        self.generation_iterations = generation_iterations;
+        self
+    }
+
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_max_routes_per_target(mut self, max_routes_per_target: usize) -> Self {
+        self.max_routes_per_target = max_routes_per_target;
         self
     }
 }
@@ -362,6 +445,137 @@ impl SynthesisPlanner {
         })
     }
 
+    pub fn analyze_reachability(
+        &self,
+        registry: &DynamicChemistryRegistry,
+        request: SynthesisReachabilityRequest,
+    ) -> ChemistryResult<SynthesisReachabilityReport> {
+        if request.targets.is_empty() {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: "<synthesis-reachability>".to_string(),
+                reason: "reachability target list must not be empty".to_string(),
+            });
+        }
+        if request.generation_iterations == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: "<synthesis-reachability>".to_string(),
+                reason: "generation_iterations must be greater than zero".to_string(),
+            });
+        }
+        if request.max_steps == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: "<synthesis-reachability>".to_string(),
+                reason: "max_steps must be greater than zero".to_string(),
+            });
+        }
+        if request.max_routes_per_target == 0 {
+            return Err(ChemistryError::InvalidReaction {
+                reaction_id: "<synthesis-reachability>".to_string(),
+                reason: "max_routes_per_target must be greater than zero".to_string(),
+            });
+        }
+
+        let mut working_registry = registry.clone();
+        let mut targets = request.targets;
+        targets.sort();
+        targets.dedup();
+        for target in &targets {
+            working_registry.substance(target)?;
+            self.safety_policy
+                .check_substance(&working_registry, target)?;
+        }
+        for substance in &request.available_substances {
+            working_registry.substance(substance)?;
+            self.safety_policy
+                .check_substance(&working_registry, substance)?;
+        }
+
+        let generation_report = if request.available_substances.is_empty() {
+            working_registry.generate_reactions(request.generation_iterations)?
+        } else {
+            working_registry.generate_reactions_for_substances(
+                request.available_substances.iter().cloned(),
+                request.generation_iterations,
+            )?
+        };
+
+        let mut target_reports = Vec::new();
+        let mut reachable_targets = Vec::new();
+        let mut unreachable_targets = Vec::new();
+        let reaction_index = build_synthesis_reaction_index(&working_registry, self);
+        for target in targets {
+            let producer_reactions = producer_reactions_for_target(&reaction_index, &target);
+            let mut visiting = BTreeSet::new();
+            let routes = backward_routes_for_target(
+                &working_registry,
+                &reaction_index,
+                &self.safety_policy,
+                &request.available_substances,
+                &target,
+                request.max_steps,
+                request.max_routes_per_target,
+                &mut visiting,
+                self,
+            )?;
+            let has_complete_route = routes
+                .iter()
+                .any(|route| route.required_additions.is_empty());
+            let target_already_available = request.available_substances.contains(&target);
+            let reachable = target_already_available || has_complete_route;
+            if reachable {
+                reachable_targets.push(target.clone());
+            } else {
+                unreachable_targets.push(target.clone());
+            }
+            let status = if target_already_available {
+                SynthesisPlanStatus::TargetAlreadyAvailable
+            } else if has_complete_route {
+                SynthesisPlanStatus::RoutesFound
+            } else if !routes.is_empty() {
+                SynthesisPlanStatus::RequiresAdditionalInputs
+            } else if producer_reactions.is_empty() {
+                SynthesisPlanStatus::UnsupportedByCurrentModel
+            } else {
+                SynthesisPlanStatus::SearchLimitReached
+            };
+            let missing_reactants = if has_complete_route {
+                Vec::new()
+            } else {
+                route_required_additions(&routes)
+            };
+            let unsupported_reason = match status {
+                SynthesisPlanStatus::UnsupportedByCurrentModel => Some(format!(
+                    "no known reaction in the current model produces '{}'",
+                    target.as_str()
+                )),
+                SynthesisPlanStatus::SearchLimitReached => Some(format!(
+                    "known producers for '{}' exist, but no route was found within {} step(s)",
+                    target.as_str(),
+                    request.max_steps
+                )),
+                _ => None,
+            };
+            target_reports.push(SynthesisTargetReachability {
+                target,
+                status,
+                has_known_producer: !producer_reactions.is_empty(),
+                producer_reactions,
+                missing_reactants,
+                routes,
+                unsupported_reason,
+            });
+        }
+
+        Ok(SynthesisReachabilityReport {
+            starting_substance_count: request.available_substances.len(),
+            target_count: target_reports.len(),
+            reachable_targets,
+            unreachable_targets,
+            target_reports,
+            generation_report,
+        })
+    }
+
     pub fn find_routes(
         &self,
         registry: &mut DynamicChemistryRegistry,
@@ -414,70 +628,83 @@ impl SynthesisPlanner {
         }
 
         let mut routes = Vec::new();
-        let mut queue = VecDeque::from([FrontierState {
-            known: initial_known.clone(),
-            steps: Vec::new(),
-            estimated_yield: 1.0,
-        }]);
-        let mut seen_known_sets = BTreeSet::from([known_set_key(&initial_known)]);
+        let mut known = initial_known.clone();
+        let mut frontier = initial_known.iter().cloned().collect::<Vec<_>>();
+        let mut product_plans = BTreeMap::<SubstanceId, ProductPlan>::new();
 
-        while let Some(state) = queue.pop_front() {
-            if state.steps.len() >= max_steps || state.known.is_empty() {
-                continue;
+        for _depth in 0..max_steps {
+            if frontier.is_empty() || routes.len() >= max_routes {
+                break;
             }
-            registry.generate_reactions_for_substances(state.known.iter().cloned(), 1)?;
-            let candidates = registry
-                .reaction_candidates_for_substances(state.known.iter())
+            registry.generate_reactions_for_substances_in_scope(
+                frontier.iter().cloned(),
+                known.iter().cloned(),
+                1,
+            )?;
+            let mut candidates = registry
+                .reaction_candidates_for_substances(known.iter())
                 .into_iter()
                 .filter(|reaction| self.reaction_allowed(reaction))
-                .filter_map(|reaction| {
-                    synthesis_step_from_available_reaction(reaction, &state.known)
-                })
+                .filter_map(|reaction| synthesis_step_from_available_reaction(reaction, &known))
                 .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                left.step_cost
+                    .total_cmp(&right.step_cost)
+                    .then_with(|| left.reaction_id.cmp(&right.reaction_id))
+            });
+
+            let mut next_frontier = Vec::new();
             for step in candidates {
-                let mut next_known = state.known.clone();
-                let mut added_new_product = false;
                 if !step_products_allowed(registry, &self.safety_policy, &step)? {
                     continue;
                 }
+                let Some(estimated_yield) =
+                    estimated_yield_for_step(&step, &product_plans, &initial_known)
+                else {
+                    continue;
+                };
                 for product in &step.products {
-                    if next_known.insert(product.clone()) {
-                        added_new_product = true;
+                    if initial_known.contains(product) {
+                        continue;
+                    }
+                    let candidate_plan = ProductPlan {
+                        step: step.clone(),
+                        estimated_yield,
+                    };
+                    if product == &target {
+                        if let Some(route) = build_forward_route_from_plan(
+                            target.clone(),
+                            candidate_plan.clone(),
+                            &product_plans,
+                            &initial_known,
+                            "route can be run from the available substances".to_string(),
+                        ) {
+                            routes.push(route);
+                            routes.sort_by(compare_routes);
+                            routes.dedup_by(|left, right| route_key(left) == route_key(right));
+                            routes.truncate(max_routes);
+                        }
+                    }
+                    if known.insert(product.clone()) {
+                        product_plans.insert(product.clone(), candidate_plan);
+                        next_frontier.push(product.clone());
+                    } else if product_plans
+                        .get(product)
+                        .is_some_and(|existing| estimated_yield > existing.estimated_yield)
+                    {
+                        product_plans.insert(product.clone(), candidate_plan);
                     }
                 }
-                if !added_new_product {
-                    continue;
-                }
-                let mut next_steps = state.steps.clone();
-                next_steps.push(step.clone());
-                let estimated_yield = state.estimated_yield * step.product_fraction;
-                if next_known.contains(&target) {
-                    routes.push(build_route(
-                        target.clone(),
-                        estimated_yield,
-                        next_steps.clone(),
-                        &initial_known,
-                        "route can be run from the available substances".to_string(),
-                    ));
-                    routes.sort_by(compare_routes);
-                    routes.truncate(max_routes);
-                    continue;
-                }
-                let key = known_set_key(&next_known);
-                if seen_known_sets.insert(key) {
-                    queue.push_back(FrontierState {
-                        known: next_known,
-                        steps: next_steps,
-                        estimated_yield,
-                    });
-                }
             }
+            frontier = next_frontier;
         }
 
         if self.include_routes_with_missing_inputs && routes.len() < max_routes {
             let mut visiting = BTreeSet::new();
+            let reaction_index = build_synthesis_reaction_index(registry, self);
             let mut backward = backward_routes_for_target(
                 registry,
+                &reaction_index,
                 &self.safety_policy,
                 &initial_known,
                 &target,
@@ -577,8 +804,86 @@ fn synthesis_step_from_reaction(
     Some(step)
 }
 
+fn estimated_yield_for_step(
+    step: &SynthesisStep,
+    product_plans: &BTreeMap<SubstanceId, ProductPlan>,
+    initial_known: &BTreeSet<SubstanceId>,
+) -> Option<f64> {
+    let mut result = step.product_fraction;
+    for reactant in &step.reactants {
+        if initial_known.contains(reactant) {
+            continue;
+        }
+        result *= product_plans.get(reactant)?.estimated_yield;
+    }
+    Some(result)
+}
+
+fn build_forward_route_from_plan(
+    target: SubstanceId,
+    target_plan: ProductPlan,
+    product_plans: &BTreeMap<SubstanceId, ProductPlan>,
+    initial_known: &BTreeSet<SubstanceId>,
+    explanation: String,
+) -> Option<SynthesisRoute> {
+    let mut steps = Vec::new();
+    let mut visiting = BTreeSet::new();
+    let mut emitted = BTreeSet::new();
+    append_step_dependencies(
+        &target_plan.step,
+        product_plans,
+        initial_known,
+        &mut visiting,
+        &mut emitted,
+        &mut steps,
+    )?;
+    if emitted.insert(target_plan.step.reaction_id.clone()) {
+        steps.push(target_plan.step);
+    }
+    Some(build_route(
+        target,
+        target_plan.estimated_yield,
+        steps,
+        initial_known,
+        explanation,
+    ))
+}
+
+fn append_step_dependencies(
+    step: &SynthesisStep,
+    product_plans: &BTreeMap<SubstanceId, ProductPlan>,
+    initial_known: &BTreeSet<SubstanceId>,
+    visiting: &mut BTreeSet<SubstanceId>,
+    emitted: &mut BTreeSet<ReactionId>,
+    steps: &mut Vec<SynthesisStep>,
+) -> Option<()> {
+    for reactant in &step.reactants {
+        if initial_known.contains(reactant) {
+            continue;
+        }
+        if !visiting.insert(reactant.clone()) {
+            return None;
+        }
+        let plan = product_plans.get(reactant)?;
+        append_step_dependencies(
+            &plan.step,
+            product_plans,
+            initial_known,
+            visiting,
+            emitted,
+            steps,
+        )?;
+        if emitted.insert(plan.step.reaction_id.clone()) {
+            steps.push(plan.step.clone());
+        }
+        visiting.remove(reactant);
+    }
+    Some(())
+}
+
 fn backward_routes_for_target(
     registry: &DynamicChemistryRegistry,
+    reaction_index: &SynthesisReactionIndex,
     safety_policy: &SynthesisSafetyPolicy,
     available: &BTreeSet<SubstanceId>,
     target: &SubstanceId,
@@ -591,11 +896,8 @@ fn backward_routes_for_target(
         return Ok(Vec::new());
     }
     let mut routes = Vec::new();
-    for reaction in registry
-        .reactions()
-        .filter(|reaction| planner.reaction_allowed(reaction))
-        .filter(|reaction| reaction_can_produce(reaction, target))
-    {
+    for reaction_id in reaction_index.producers(target) {
+        let reaction = registry.reaction(reaction_id)?;
         let Some(step) = synthesis_step_from_reaction(reaction, available) else {
             continue;
         };
@@ -612,6 +914,7 @@ fn backward_routes_for_target(
             }
             let nested = backward_routes_for_target(
                 registry,
+                reaction_index,
                 safety_policy,
                 available,
                 &reactant,
@@ -679,6 +982,37 @@ fn reaction_can_produce(reaction: &Reaction, target: &SubstanceId) -> bool {
     reaction_products(reaction)
         .iter()
         .any(|product| product == target)
+}
+
+fn build_synthesis_reaction_index(
+    registry: &DynamicChemistryRegistry,
+    planner: &SynthesisPlanner,
+) -> SynthesisReactionIndex {
+    let mut index = SynthesisReactionIndex::default();
+    for reaction in registry
+        .reactions()
+        .filter(|reaction| planner.reaction_allowed(reaction))
+    {
+        for product in reaction_products(reaction) {
+            index
+                .producers_by_product
+                .entry(product)
+                .or_default()
+                .push(reaction.id.clone());
+        }
+    }
+    for producers in index.producers_by_product.values_mut() {
+        producers.sort();
+        producers.dedup();
+    }
+    index
+}
+
+fn producer_reactions_for_target(
+    reaction_index: &SynthesisReactionIndex,
+    target: &SubstanceId,
+) -> Vec<ReactionId> {
+    reaction_index.producers(target).to_vec()
 }
 
 fn reaction_products(reaction: &Reaction) -> Vec<SubstanceId> {
@@ -991,10 +1325,6 @@ fn route_condition_hints(steps: &[SynthesisStep]) -> Vec<SynthesisConditionHint>
         .collect()
 }
 
-fn known_set_key(known: &BTreeSet<SubstanceId>) -> Vec<SubstanceId> {
-    known.iter().cloned().collect()
-}
-
 fn route_key(route: &SynthesisRoute) -> Vec<String> {
     route
         .steps
@@ -1152,6 +1482,125 @@ mod tests {
             .unsupported_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("destroy:argon")));
+    }
+
+    #[test]
+    fn reachability_report_distinguishes_reachable_targets_from_model_gaps() {
+        let registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let before_reactions = registry.reactions().count();
+        let report = SynthesisPlanner::new()
+            .analyze_reachability(
+                &registry,
+                SynthesisReachabilityRequest::new([
+                    SubstanceId::from("destroy:ethanol"),
+                    SubstanceId::from("destroy:argon"),
+                ])
+                .with_available_substance("destroy:chloroethane")
+                .with_available_substance("destroy:hydroxide")
+                .with_generation_iterations(1)
+                .with_max_steps(2)
+                .with_max_routes_per_target(2),
+            )
+            .unwrap();
+
+        assert_eq!(report.starting_substance_count, 2);
+        assert_eq!(report.target_count, 2);
+        assert!(report
+            .reachable_targets
+            .contains(&SubstanceId::from("destroy:ethanol")));
+        assert!(report
+            .unreachable_targets
+            .contains(&SubstanceId::from("destroy:argon")));
+        assert!(report
+            .target_reports
+            .iter()
+            .find(|target| target.target == SubstanceId::from("destroy:ethanol"))
+            .is_some_and(|target| {
+                target.status == SynthesisPlanStatus::RoutesFound
+                    && target.has_known_producer
+                    && target.producer_reactions.iter().any(|reaction| {
+                        reaction
+                            .as_str()
+                            .starts_with("halide_hydroxide_substitution/")
+                    })
+            }));
+        assert!(report
+            .target_reports
+            .iter()
+            .find(|target| target.target == SubstanceId::from("destroy:argon"))
+            .is_some_and(|target| {
+                target.status == SynthesisPlanStatus::UnsupportedByCurrentModel
+                    && !target.has_known_producer
+                    && target.missing_reactants.is_empty()
+            }));
+        assert_eq!(registry.reactions().count(), before_reactions);
+    }
+
+    #[test]
+    fn reachability_gap_report_covers_representative_closed_families_without_mutating_registry() {
+        let registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let before_reactions = registry.reactions().count();
+        let representative_targets = [
+            "destroy:acetone_cyanohydrin",
+            "destroy:cubane",
+            "destroy:iodomethane",
+            "destroy:isopropanol",
+        ]
+        .into_iter()
+        .map(SubstanceId::from)
+        .collect::<Vec<_>>();
+        let simple_feedstocks = [
+            "destroy:propene",
+            "destroy:methanol",
+            "destroy:acetone",
+            "destroy:water",
+            "destroy:hydrogen_cyanide",
+            "destroy:cyanide",
+            "destroy:hydroiodic_acid",
+            "destroy:proton",
+        ]
+        .into_iter()
+        .map(SubstanceId::from)
+        .collect::<Vec<_>>();
+        let report = SynthesisPlanner::new()
+            .with_max_routes(2)
+            .analyze_reachability(
+                &registry,
+                SynthesisReachabilityRequest::new(representative_targets.clone())
+                    .with_available_substances(simple_feedstocks)
+                    .with_generation_iterations(1)
+                    .with_max_steps(4)
+                    .with_max_routes_per_target(2),
+            )
+            .unwrap();
+
+        assert_eq!(report.target_count, representative_targets.len());
+        assert_eq!(registry.reactions().count(), before_reactions);
+        for target in [
+            "destroy:acetone_cyanohydrin",
+            "destroy:iodomethane",
+            "destroy:isopropanol",
+        ] {
+            assert!(
+                report
+                    .reachable_targets
+                    .contains(&SubstanceId::from(target)),
+                "{target} should remain reachable through a general reaction family"
+            );
+        }
+        let cubane_report = report
+            .target_reports
+            .iter()
+            .find(|target| target.target == SubstanceId::from("destroy:cubane"))
+            .expect("representative report must include cubane");
+        assert_eq!(
+            cubane_report.status,
+            SynthesisPlanStatus::UnsupportedByCurrentModel
+        );
+        assert!(
+            cubane_report.routes.is_empty(),
+            "cubane must not be reported as synthesizable unless a general strained-ring route exists"
+        );
     }
 
     #[test]
@@ -1445,5 +1894,312 @@ mod tests {
         assert!(best.steps.last().is_some_and(|step| step
             .products
             .contains(&SubstanceId::from("destroy:acetylene"))));
+    }
+
+    #[test]
+    fn planner_reaches_conjugated_dienes_through_general_pyrolysis() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let butane = registry.resolve_frowns("CCCC").unwrap();
+        let butadiene_routes = SynthesisPlanner::new()
+            .with_max_steps(2)
+            .allow_reaction_prefix("pyrolysis/")
+            .find_routes(&mut registry, [butane], parse_frowns("C=CC=C").unwrap())
+            .unwrap();
+        assert!(!butadiene_routes.is_empty());
+        assert!(butadiene_routes[0]
+            .steps
+            .iter()
+            .all(|step| step.reaction_id.as_str().starts_with("pyrolysis/")));
+        assert!(butadiene_routes[0].steps.last().is_some_and(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:butadiene"))));
+
+        let isopentane = registry.resolve_frowns("CC(C)CC").unwrap();
+        let isoprene_routes = SynthesisPlanner::new()
+            .with_max_steps(2)
+            .allow_reaction_prefix("pyrolysis/")
+            .find_routes(
+                &mut registry,
+                [isopentane],
+                parse_frowns("C=C(C)C=C").unwrap(),
+            )
+            .unwrap();
+        assert!(!isoprene_routes.is_empty());
+        assert!(isoprene_routes[0]
+            .steps
+            .iter()
+            .all(|step| step.reaction_id.as_str().starts_with("pyrolysis/")));
+        assert!(isoprene_routes[0].steps.last().is_some_and(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:isoprene"))));
+    }
+
+    #[test]
+    fn planner_reaches_benzyl_chloroformate_through_benzylic_side_chain_chemistry() {
+        let registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let routes = SynthesisPlanner::new()
+            .with_max_steps(3)
+            .with_max_routes(4)
+            .allow_reaction_prefix("radical_halogenation/")
+            .allow_reaction_prefix("halide_hydroxide_substitution/")
+            .allow_reaction_prefix("alcohol_chloroformate_formation/")
+            .plan_routes(
+                &registry,
+                SynthesisRequest::for_substance("destroy:benzyl_chloroformate")
+                    .with_available_substance("destroy:toluene")
+                    .with_available_substance("destroy:chlorine")
+                    .with_available_substance("destroy:hydroxide")
+                    .with_available_substance("destroy:phosgene"),
+            )
+            .unwrap();
+
+        assert!(!routes.is_empty());
+        let reaction_ids = routes[0]
+            .steps
+            .iter()
+            .map(|step| step.reaction_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(reaction_ids
+            .iter()
+            .any(|id| id.starts_with("radical_halogenation/")));
+        assert!(reaction_ids
+            .iter()
+            .any(|id| id.starts_with("halide_hydroxide_substitution/")));
+        assert!(reaction_ids
+            .iter()
+            .any(|id| id.starts_with("alcohol_chloroformate_formation/")));
+        assert!(routes[0].steps.last().is_some_and(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:benzyl_chloroformate"))));
+    }
+
+    #[test]
+    fn planner_reaches_c6_nitrile_amine_isocyanate_chain_by_general_layers() {
+        let registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let adiponitrile_routes = SynthesisPlanner::new()
+            .with_max_steps(2)
+            .with_max_routes(4)
+            .allow_reaction_prefix("alkene_hydrocyanation/")
+            .plan_routes(
+                &registry,
+                SynthesisRequest::for_substance("destroy:adiponitrile")
+                    .with_available_substance("destroy:butadiene")
+                    .with_available_substance("destroy:hydrogen_cyanide"),
+            )
+            .unwrap();
+        assert!(!adiponitrile_routes.is_empty());
+        assert!(adiponitrile_routes[0].steps.iter().all(|step| step
+            .reaction_id
+            .as_str()
+            .starts_with("alkene_hydrocyanation/")));
+
+        let hexanediamine_routes = SynthesisPlanner::new()
+            .with_max_steps(2)
+            .with_max_routes(4)
+            .allow_reaction_prefix("nitrile_hydrogenation/")
+            .plan_routes(
+                &registry,
+                SynthesisRequest::for_substance("destroy:hexanediamine")
+                    .with_available_substance("destroy:adiponitrile")
+                    .with_available_substance("destroy:hydrogen"),
+            )
+            .unwrap();
+        assert!(!hexanediamine_routes.is_empty());
+        assert!(hexanediamine_routes[0].steps.iter().all(|step| step
+            .reaction_id
+            .as_str()
+            .starts_with("nitrile_hydrogenation/")));
+
+        let diisocyanate_routes = SynthesisPlanner::new()
+            .with_max_steps(2)
+            .with_max_routes(4)
+            .allow_reaction_prefix("amine_phosgenation/")
+            .plan_routes(
+                &registry,
+                SynthesisRequest::for_substance("destroy:hexane_diisocyanate")
+                    .with_available_substance("destroy:hexanediamine")
+                    .with_available_substance("destroy:phosgene"),
+            )
+            .unwrap();
+        assert!(!diisocyanate_routes.is_empty());
+        assert!(diisocyanate_routes[0]
+            .steps
+            .iter()
+            .all(|step| step.reaction_id.as_str().starts_with("amine_phosgenation/")));
+    }
+
+    #[test]
+    fn planner_reaches_iodomethane_through_general_alcohol_hydrohalogenation() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let routes = SynthesisPlanner::new()
+            .with_max_steps(1)
+            .allow_reaction_prefix("alcohol_hydrohalogenation/")
+            .find_routes(
+                &mut registry,
+                [
+                    SubstanceId::from("destroy:methanol"),
+                    SubstanceId::from("destroy:hydroiodic_acid"),
+                ],
+                parse_frowns("CI").unwrap(),
+            )
+            .unwrap();
+
+        assert!(!routes.is_empty());
+        assert!(routes[0].steps.iter().any(|step| step
+            .reaction_id
+            .as_str()
+            .starts_with("alcohol_hydrohalogenation/")));
+        assert!(routes[0].steps.iter().any(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:iodomethane"))));
+    }
+
+    #[test]
+    fn planner_reaches_acetone_cyanohydrin_through_general_carbonyl_addition() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let routes = SynthesisPlanner::new()
+            .with_max_steps(1)
+            .allow_reaction_prefix("cyanide_nucleophilic_addition/")
+            .find_routes(
+                &mut registry,
+                [
+                    SubstanceId::from("destroy:acetone"),
+                    SubstanceId::from("destroy:hydrogen_cyanide"),
+                    SubstanceId::from("destroy:cyanide"),
+                ],
+                parse_frowns("CC(OH)(C#N)C").unwrap(),
+            )
+            .unwrap();
+
+        assert!(!routes.is_empty());
+        assert!(routes[0].steps.iter().any(|step| step
+            .reaction_id
+            .as_str()
+            .starts_with("cyanide_nucleophilic_addition/")));
+        assert!(routes[0].steps.iter().any(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:acetone_cyanohydrin"))));
+    }
+
+    #[test]
+    fn planner_reaches_branched_alcohols_through_general_alkene_hydration() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let isopropanol_routes = SynthesisPlanner::new()
+            .with_max_steps(1)
+            .allow_reaction_prefix("alkene_hydrolysis/")
+            .find_routes(
+                &mut registry,
+                [
+                    SubstanceId::from("destroy:propene"),
+                    SubstanceId::from("destroy:water"),
+                    SubstanceId::from("destroy:proton"),
+                ],
+                parse_frowns("CC(O)C").unwrap(),
+            )
+            .unwrap();
+        assert!(!isopropanol_routes.is_empty());
+        assert!(isopropanol_routes[0].steps.iter().any(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:isopropanol"))));
+
+        let isobutene = registry.resolve_frowns("C=C(C)C").unwrap();
+        let tert_butanol_routes = SynthesisPlanner::new()
+            .with_max_steps(1)
+            .allow_reaction_prefix("alkene_hydrolysis/")
+            .find_routes(
+                &mut registry,
+                [
+                    isobutene,
+                    SubstanceId::from("destroy:water"),
+                    SubstanceId::from("destroy:proton"),
+                ],
+                parse_frowns("CC(C)(C)O").unwrap(),
+            )
+            .unwrap();
+        assert!(!tert_butanol_routes.is_empty());
+        assert!(tert_butanol_routes[0].steps.iter().any(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:tert_butanol"))));
+    }
+
+    #[test]
+    fn planner_reaches_trimethyl_borate_by_repeating_borate_esterification() {
+        let mut registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let routes = SynthesisPlanner::new()
+            .with_max_steps(3)
+            .allow_reaction_prefix("borate_esterification/")
+            .find_routes(
+                &mut registry,
+                [
+                    SubstanceId::from("destroy:boric_acid"),
+                    SubstanceId::from("destroy:methanol"),
+                ],
+                parse_frowns("COB(OC)OC").unwrap(),
+            )
+            .unwrap();
+
+        assert!(!routes.is_empty());
+        assert_eq!(routes[0].steps.len(), 3);
+        assert!(routes[0].steps.iter().all(|step| step
+            .reaction_id
+            .as_str()
+            .starts_with("borate_esterification/")));
+        assert!(routes[0].steps.last().is_some_and(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:trimethyl_borate"))));
+    }
+
+    #[test]
+    fn planner_reaches_cubane_dicarboxylic_acid_through_bridgehead_functionalization() {
+        let registry = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let routes = SynthesisPlanner::new()
+            .with_max_steps(6)
+            .with_max_routes(4)
+            .allow_reaction_prefix("radical_halogenation/")
+            .allow_reaction_prefix("organomagnesium_formation/")
+            .allow_reaction_prefix("organometallic_carboxylation/")
+            .plan_routes(
+                &registry,
+                SynthesisRequest::for_substance("destroy:cubanedicarboxylic_acid")
+                    .with_available_substance("destroy:cubane")
+                    .with_available_substance("destroy:chlorine")
+                    .with_available_substance("destroy:carbon_dioxide")
+                    .with_available_substance("destroy:water"),
+            )
+            .unwrap();
+
+        assert!(
+            !routes.is_empty(),
+            "cubane dicarboxylic acid should be reachable through general bridgehead halogenation, organometallic formation, and carboxylation"
+        );
+        let reaction_ids = routes[0]
+            .steps
+            .iter()
+            .map(|step| step.reaction_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            reaction_ids
+                .iter()
+                .filter(|id| id.starts_with("radical_halogenation/"))
+                .count()
+                >= 2
+        );
+        assert!(
+            reaction_ids
+                .iter()
+                .filter(|id| id.starts_with("organomagnesium_formation/"))
+                .count()
+                >= 2
+        );
+        assert!(
+            reaction_ids
+                .iter()
+                .filter(|id| id.starts_with("organometallic_carboxylation/"))
+                .count()
+                >= 2
+        );
+        assert!(routes[0].steps.last().is_some_and(|step| step
+            .products
+            .contains(&SubstanceId::from("destroy:cubanedicarboxylic_acid"))));
     }
 }

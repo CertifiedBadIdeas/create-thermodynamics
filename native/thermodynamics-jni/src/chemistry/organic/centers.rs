@@ -107,6 +107,13 @@ pub(crate) struct AcylChlorideSite<'a> {
 }
 
 #[derive(Clone)]
+pub(crate) struct ChloroformateSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) carbon: usize,
+    pub(crate) chlorine: usize,
+}
+
+#[derive(Clone)]
 pub(crate) struct AcidAnhydrideSite<'a> {
     pub(crate) participant: SiteParticipant<'a>,
     pub(crate) carbon_a: usize,
@@ -331,6 +338,14 @@ pub(crate) struct BoraneSite<'a> {
     pub(crate) participant: SiteParticipant<'a>,
     pub(crate) carbon: usize,
     pub(crate) boron: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoricAcidSite<'a> {
+    pub(crate) participant: SiteParticipant<'a>,
+    pub(crate) boron: usize,
+    pub(crate) hydroxyl_oxygen: usize,
+    pub(crate) hydroxyl_hydrogen: usize,
 }
 
 #[derive(Clone)]
@@ -607,6 +622,30 @@ impl<'a> SiteParticipant<'a> {
         let (carbon, _) = carbonyl_atoms_from_site(self.structure, &self.site, "acyl chloride")?;
         let chlorine = self.bonded_site_atom(carbon, "Cl", 1.0, "acyl chloride chlorine")?;
         Ok(AcylChlorideSite {
+            participant: self,
+            carbon,
+            chlorine,
+        })
+    }
+
+    pub(crate) fn chloroformate_site(self) -> ChemistryResult<ChloroformateSite<'a>> {
+        self.require_kind(ReactiveSiteKind::Chloroformate)?;
+        let (carbon, _) = carbonyl_atoms_from_site(self.structure, &self.site, "chloroformate")?;
+        let chlorine = self.bonded_site_atom(carbon, "Cl", 1.0, "chloroformate chlorine")?;
+        self.structure
+            .neighbors(carbon)
+            .into_iter()
+            .find_map(|(neighbor, order)| {
+                (neighbor != chlorine
+                    && self.structure.atoms[neighbor].element == "O"
+                    && crate::chemistry::molecule::bond_order_matches(order, 1.0))
+                .then_some(neighbor)
+            })
+            .ok_or_else(|| ChemistryError::InvalidReaction {
+                reaction_id: generated_site_reaction_id("chloroformate_site", &self),
+                reason: "chloroformate has no alkoxy oxygen".to_string(),
+            })?;
+        Ok(ChloroformateSite {
             participant: self,
             carbon,
             chlorine,
@@ -1275,6 +1314,20 @@ impl<'a> SiteParticipant<'a> {
             participant: self,
             carbon,
             boron,
+        })
+    }
+
+    pub(crate) fn boric_acid_site(self) -> ChemistryResult<BoricAcidSite<'a>> {
+        self.require_kind(ReactiveSiteKind::BoricAcid)?;
+        let boron = self.site_atom_by_element("B", "boric acid boron")?;
+        let hydroxyl_oxygen = self.bonded_site_atom(boron, "O", 1.0, "boric acid hydroxyl")?;
+        let hydroxyl_hydrogen =
+            self.bonded_site_atom(hydroxyl_oxygen, "H", 1.0, "boric acid hydroxyl hydrogen")?;
+        Ok(BoricAcidSite {
+            participant: self,
+            boron,
+            hydroxyl_oxygen,
+            hydroxyl_hydrogen,
         })
     }
 

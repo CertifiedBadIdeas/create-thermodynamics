@@ -27,6 +27,10 @@ pub(crate) fn add_addition_group(
             editor.add_atom(boron, "H", 0.0, 1.0)?;
             editor.add_atom(boron, "H", 0.0, 1.0)?;
         }
+        AdditionGroup::Nitrile => {
+            let carbon = editor.add_atom(parent, "C", 0.0, 1.0)?;
+            editor.add_atom(carbon, "N", 0.0, 3.0)?;
+        }
     }
     Ok(())
 }
@@ -274,6 +278,7 @@ pub(crate) fn site_kind_suffix(kind: &ReactiveSiteKind) -> &'static str {
         ReactiveSiteKind::Amide => "amide",
         ReactiveSiteKind::AmideNitrogen => "amide_nitrogen",
         ReactiveSiteKind::AromaticCarbon => "aromatic_carbon",
+        ReactiveSiteKind::AromatizingCarbonAcid => "aromatizing_carbon_acid",
         ReactiveSiteKind::AromaticRing => "aromatic_ring",
         ReactiveSiteKind::ArylHalide => "aryl_halide",
         ReactiveSiteKind::Azide => "azide",
@@ -282,6 +287,7 @@ pub(crate) fn site_kind_suffix(kind: &ReactiveSiteKind) -> &'static str {
         ReactiveSiteKind::BorateEster => "borate_ester",
         ReactiveSiteKind::Carbonyl => "carbonyl",
         ReactiveSiteKind::CarboxylicAcid => "carboxylic_acid",
+        ReactiveSiteKind::Chloroformate => "chloroformate",
         ReactiveSiteKind::Diazonium => "diazonium",
         ReactiveSiteKind::Enol => "enol",
         ReactiveSiteKind::Enolate => "enolate",

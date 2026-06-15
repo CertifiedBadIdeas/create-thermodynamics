@@ -39,6 +39,7 @@ const ACTIVE_DESTROY_GENERIC_REACTIONS: &[&str] = &[
     "amide_hydrolysis",
     "amine_phosgenation",
     "borane_oxidation",
+    "borate_esterification",
     "borate_ester_hydrolysis",
     "borohydride_carbonyl_reduction",
     "cyanamide_addition",
@@ -57,11 +58,8 @@ const ACTIVE_DESTROY_GENERIC_REACTIONS: &[&str] = &[
     "wolff_kishner_reduction",
 ];
 
-const EXCLUDED_DESTROY_GENERIC_REACTIONS: &[&str] = &[
-    "electrophilic_hydroboration",
-    "borate_esterification",
-    "carboxylic_acid_reduction",
-];
+const EXCLUDED_DESTROY_GENERIC_REACTIONS: &[&str] =
+    &["electrophilic_hydroboration", "carboxylic_acid_reduction"];
 
 const ACTIVE_GENERATORS_WITHOUT_CATALOG_SUBSTRATE: &[&str] = &["aldehyde_oxidation"];
 const ACTIVE_GENERATORS_WITH_UNKNOWN_STEREO_DISTRIBUTION: &[&str] = &[];
@@ -197,6 +195,456 @@ fn reaction_with_prefix<'a>(registry: &'a ChemistryRegistry, prefix: &str) -> &'
         .reactions()
         .find(|reaction| reaction.id.as_str().starts_with(prefix))
         .unwrap_or_else(|| panic!("missing generated reaction with prefix {prefix}"))
+}
+
+fn reaction_with_prefix_and_suffix<'a>(
+    registry: &'a ChemistryRegistry,
+    prefix: &str,
+    suffix: &str,
+) -> &'a Reaction {
+    registry
+        .reactions()
+        .find(|reaction| {
+            reaction.id.as_str().starts_with(prefix) && reaction.id.as_str().ends_with(suffix)
+        })
+        .unwrap_or_else(|| {
+            panic!("missing generated reaction with prefix {prefix} and suffix {suffix}")
+        })
+}
+
+fn reaction_product_ids(reaction: &Reaction) -> Vec<SubstanceId> {
+    let mut products = reaction
+        .products
+        .iter()
+        .map(|term| term.substance_id.clone())
+        .collect::<Vec<_>>();
+    for channel in &reaction.channels {
+        products.extend(
+            channel
+                .products
+                .iter()
+                .map(|term| term.substance_id.clone()),
+        );
+    }
+    if let Some(distribution) = &reaction.product_distribution {
+        for variant in &distribution.variants {
+            products.extend(
+                variant
+                    .products
+                    .iter()
+                    .map(|term| term.substance_id.clone()),
+            );
+        }
+    }
+    products.sort();
+    products.dedup();
+    products
+}
+
+#[test]
+fn alcohol_hydrohalogenation_generates_alkyl_halides_as_a_family() {
+    let registry = generated_registry();
+    let methyl_iodide = reaction_with_prefix_and_suffix(
+        &registry,
+        "alcohol_hydrohalogenation/destroy_methanol/",
+        "/iodide",
+    );
+    assert!(methyl_iodide
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:methanol")));
+    assert!(methyl_iodide
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydroiodic_acid")));
+    assert!(methyl_iodide
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:iodomethane")));
+    assert!(methyl_iodide
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:water")));
+
+    let ethyl_chloride = reaction_with_prefix_and_suffix(
+        &registry,
+        "alcohol_hydrohalogenation/destroy_ethanol/",
+        "/chloride",
+    );
+    assert!(ethyl_chloride
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:ethanol")));
+    assert!(ethyl_chloride
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrochloric_acid")));
+    assert!(ethyl_chloride
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:chloroethane")));
+    assert!(ethyl_chloride
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:water")));
+}
+
+#[test]
+fn alcohol_chloroformate_formation_generates_activated_carbonates_as_a_family() {
+    let registry = generated_registry();
+    for alcohol in ["methanol", "ethanol"] {
+        let alcohol_id = format!("destroy:{alcohol}");
+        let reaction = reaction_with_prefix(
+            &registry,
+            &format!("alcohol_chloroformate_formation/destroy_{alcohol}/"),
+        );
+        assert!(reaction
+            .reactants
+            .iter()
+            .any(|term| term.substance_id == SubstanceId::from(alcohol_id.as_str())));
+        assert!(reaction
+            .reactants
+            .iter()
+            .any(|term| term.substance_id == SubstanceId::from("destroy:phosgene")));
+        assert!(reaction
+            .products
+            .iter()
+            .any(|term| term.substance_id == SubstanceId::from("destroy:hydrochloric_acid")));
+
+        let product_ids = reaction_product_ids(reaction);
+        let chloroformate = product_ids
+            .iter()
+            .filter_map(|product| registry.substance(product).ok())
+            .filter_map(|substance| substance.molecular_structure.as_ref())
+            .find(|structure| has_chloroformate_fragment(structure))
+            .expect("alcohol chloroformate formation must produce a chloroformate");
+        assert!(has_chloroformate_fragment(chloroformate));
+    }
+}
+
+#[test]
+fn chloroformates_transfer_to_alcohols_and_amines_as_a_family() {
+    let mut registry =
+        crate::chemistry::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    registry
+        .generate_reactions_for_substances(
+            [
+                SubstanceId::from("destroy:methanol"),
+                SubstanceId::from("destroy:ethanol"),
+                SubstanceId::from("destroy:ammonia"),
+                SubstanceId::from("destroy:phosgene"),
+            ],
+            3,
+        )
+        .unwrap();
+
+    let carbonate = registry
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("chloroformate_alcohol_carbonate_formation/")
+        })
+        .expect("dynamic chloroformate must acylate alcohols");
+    assert!(carbonate
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrochloric_acid")));
+    assert!(reaction_product_ids(carbonate)
+        .iter()
+        .any(|product| registry
+            .substance(product)
+            .ok()
+            .and_then(|substance| substance.molecular_structure.as_ref())
+            .is_some_and(has_carbonate_fragment)));
+
+    let carbamate = registry
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("chloroformate_amine_carbamate_formation/")
+        })
+        .expect("dynamic chloroformate must acylate amines");
+    assert!(carbamate
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrochloric_acid")));
+    assert!(reaction_product_ids(carbamate)
+        .iter()
+        .any(|product| registry
+            .substance(product)
+            .ok()
+            .and_then(|substance| substance.molecular_structure.as_ref())
+            .is_some_and(has_carbamate_fragment)));
+}
+
+fn has_chloroformate_fragment(structure: &crate::chemistry::molecule::MolecularStructure) -> bool {
+    structure
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, atom)| atom.element == "C")
+        .any(|(carbon, _)| {
+            let has_double_oxygen =
+                structure
+                    .neighbors(carbon)
+                    .into_iter()
+                    .any(|(neighbor, order)| {
+                        structure.atoms[neighbor].element == "O"
+                            && crate::chemistry::molecule::bond_order_matches(order, 2.0)
+                    });
+            let has_single_oxygen =
+                structure
+                    .neighbors(carbon)
+                    .into_iter()
+                    .any(|(neighbor, order)| {
+                        structure.atoms[neighbor].element == "O"
+                            && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+                    });
+            let has_chlorine = structure
+                .neighbors(carbon)
+                .into_iter()
+                .any(|(neighbor, order)| {
+                    structure.atoms[neighbor].element == "Cl"
+                        && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+                });
+            has_double_oxygen && has_single_oxygen && has_chlorine
+        })
+}
+
+fn has_carbonate_fragment(structure: &crate::chemistry::molecule::MolecularStructure) -> bool {
+    structure
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, atom)| atom.element == "C")
+        .any(|(carbon, _)| {
+            let double_oxygens = structure
+                .neighbors(carbon)
+                .into_iter()
+                .filter(|(neighbor, order)| {
+                    structure.atoms[*neighbor].element == "O"
+                        && crate::chemistry::molecule::bond_order_matches(*order, 2.0)
+                })
+                .count();
+            let single_oxygens = structure
+                .neighbors(carbon)
+                .into_iter()
+                .filter(|(neighbor, order)| {
+                    structure.atoms[*neighbor].element == "O"
+                        && crate::chemistry::molecule::bond_order_matches(*order, 1.0)
+                })
+                .count();
+            double_oxygens == 1 && single_oxygens == 2
+        })
+}
+
+fn has_carbamate_fragment(structure: &crate::chemistry::molecule::MolecularStructure) -> bool {
+    structure
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, atom)| atom.element == "C")
+        .any(|(carbon, _)| {
+            let has_double_oxygen =
+                structure
+                    .neighbors(carbon)
+                    .into_iter()
+                    .any(|(neighbor, order)| {
+                        structure.atoms[neighbor].element == "O"
+                            && crate::chemistry::molecule::bond_order_matches(order, 2.0)
+                    });
+            let has_single_oxygen =
+                structure
+                    .neighbors(carbon)
+                    .into_iter()
+                    .any(|(neighbor, order)| {
+                        structure.atoms[neighbor].element == "O"
+                            && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+                    });
+            let has_single_nitrogen =
+                structure
+                    .neighbors(carbon)
+                    .into_iter()
+                    .any(|(neighbor, order)| {
+                        structure.atoms[neighbor].element == "N"
+                            && crate::chemistry::molecule::bond_order_matches(order, 1.0)
+                    });
+            has_double_oxygen && has_single_oxygen && has_single_nitrogen
+        })
+}
+
+#[test]
+fn borate_esterification_generates_boron_esters_as_a_family() {
+    let registry = generated_registry();
+    let methyl_borate = reaction_with_prefix(
+        &registry,
+        "borate_esterification/destroy_boric_acid/destroy_methanol/",
+    );
+    assert!(methyl_borate
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:boric_acid")));
+    assert!(methyl_borate
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:methanol")));
+    assert!(methyl_borate
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str().starts_with("destroy:linear:")));
+    assert!(methyl_borate
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:water")));
+
+    let ethyl_borate = reaction_with_prefix(
+        &registry,
+        "borate_esterification/destroy_boric_acid/destroy_ethanol/",
+    );
+    assert!(ethyl_borate
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:ethanol")));
+    assert!(ethyl_borate
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:water")));
+}
+
+#[test]
+fn alkene_hydrocyanation_generates_nitriles_as_a_family() {
+    let registry = generated_registry();
+    let ethene_hydrocyanation =
+        reaction_with_prefix(&registry, "alkene_hydrocyanation/destroy_ethene/");
+    assert!(ethene_hydrocyanation
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:ethene")));
+    assert!(ethene_hydrocyanation
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrogen_cyanide")));
+    let ethene_product_ids = reaction_product_ids(ethene_hydrocyanation);
+    let ethene_product = ethene_product_ids
+        .iter()
+        .filter_map(|product| registry.substance(product).ok())
+        .filter_map(|substance| substance.molecular_structure.as_ref())
+        .find(|structure| {
+            try_find_reactive_sites(structure).is_ok_and(|sites| {
+                sites
+                    .iter()
+                    .any(|site| site.kind == ReactiveSiteKind::Nitrile)
+            })
+        })
+        .expect("ethene hydrocyanation must produce a molecular nitrile");
+    assert!(try_find_reactive_sites(ethene_product)
+        .unwrap()
+        .iter()
+        .any(|site| site.kind == ReactiveSiteKind::Nitrile));
+
+    let propene_hydrocyanation =
+        reaction_with_prefix(&registry, "alkene_hydrocyanation/destroy_propene/");
+    assert!(propene_hydrocyanation
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:propene")));
+    assert!(propene_hydrocyanation
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrogen_cyanide")));
+}
+
+#[test]
+fn cyanide_addition_generates_cyanohydrins_as_a_family() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let acetaldehyde = dynamic.resolve_frowns("CC=O").unwrap();
+    dynamic
+        .generate_reactions_for_substances(
+            [SubstanceId::from("destroy:acetone"), acetaldehyde.clone()],
+            1,
+        )
+        .unwrap();
+
+    let acetone_cyanohydrin = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("cyanide_nucleophilic_addition/destroy_acetone/")
+        })
+        .expect("acetone must form a cyanohydrin through the general carbonyl generator");
+    assert!(acetone_cyanohydrin
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:hydrogen_cyanide")));
+    assert_eq!(
+        acetone_cyanohydrin
+            .orders
+            .get(&SubstanceId::from("destroy:cyanide")),
+        Some(&1)
+    );
+    assert!(acetone_cyanohydrin
+        .products
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:acetone_cyanohydrin")));
+
+    let aldehyde_cyanohydrin = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("cyanide_nucleophilic_addition/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == acetaldehyde)
+        })
+        .and_then(|reaction| reaction.products.first())
+        .map(|term| term.substance_id.clone())
+        .expect("dynamic aldehyde must use the same cyanohydrin generator");
+    let aldehyde_product = dynamic.substance(&aldehyde_cyanohydrin).unwrap();
+    let site_kinds = try_find_reactive_sites(
+        aldehyde_product
+            .molecular_structure
+            .as_ref()
+            .expect("cyanohydrin product must keep a graph"),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|site| site.kind)
+    .collect::<BTreeSet<_>>();
+    assert!(site_kinds.contains(&ReactiveSiteKind::Alcohol));
+    assert!(site_kinds.contains(&ReactiveSiteKind::Nitrile));
+}
+
+#[test]
+fn repeated_borate_esterification_reaches_trimethyl_borate_without_targeted_reaction() {
+    let mut registry =
+        crate::chemistry::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    registry
+        .generate_reactions_for_substances(
+            [
+                SubstanceId::from("destroy:boric_acid"),
+                SubstanceId::from("destroy:methanol"),
+            ],
+            3,
+        )
+        .unwrap();
+
+    assert!(registry.reactions().any(|reaction| {
+        reaction.id.as_str().starts_with("borate_esterification/")
+            && reaction
+                .products
+                .iter()
+                .any(|term| term.substance_id == SubstanceId::from("destroy:trimethyl_borate"))
+    }));
 }
 
 #[test]
@@ -576,6 +1024,91 @@ fn organometallic_reagent_adds_to_nitrile_and_opens_epoxide() {
         .id
         .as_str()
         .starts_with("organometallic_epoxide_opening/")));
+}
+
+#[test]
+fn organometallic_reagent_carboxylates_with_carbon_dioxide() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let methyl_magnesium_chloride = dynamic.resolve_frowns("CMgCl").unwrap();
+    dynamic
+        .generate_reactions_for_substances(
+            [
+                methyl_magnesium_chloride,
+                SubstanceId::from("destroy:carbon_dioxide"),
+                SubstanceId::from("destroy:water"),
+            ],
+            1,
+        )
+        .unwrap();
+
+    let carboxylation = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("organometallic_carboxylation/")
+        })
+        .expect("organometallic reagent must carboxylate with carbon dioxide");
+    assert!(carboxylation
+        .reactants
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:carbon_dioxide"));
+    assert!(carboxylation
+        .products
+        .iter()
+        .any(|term| term.substance_id.as_str() == "destroy:acetic_acid"));
+    assert!(!carboxylation.external_products.is_empty());
+
+    dynamic.to_registry().unwrap();
+}
+
+#[test]
+fn bridgehead_halide_can_form_organometallic_but_ordinary_tertiary_halide_cannot() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let cubyl_chloride = dynamic.resolve_frowns("destroy:cubane:Cl,,,,,,,").unwrap();
+    let tert_butyl_chloride = dynamic.resolve_frowns("CC(C)(C)Cl").unwrap();
+    dynamic
+        .generate_reactions_for_substances([cubyl_chloride.clone(), tert_butyl_chloride.clone()], 1)
+        .unwrap();
+
+    let bridgehead_organometallic = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("organomagnesium_formation/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == cubyl_chloride)
+        })
+        .expect("bridgehead halide must be eligible for organometallic insertion");
+    assert!(dynamic
+        .substance(&bridgehead_organometallic.products[0].substance_id)
+        .unwrap()
+        .molecular_structure
+        .as_ref()
+        .is_some_and(|structure| try_find_reactive_sites(structure)
+            .unwrap()
+            .into_iter()
+            .any(|site| site.kind == ReactiveSiteKind::Organomagnesium)));
+
+    assert!(dynamic.reactions().all(|reaction| {
+        !reaction
+            .id
+            .as_str()
+            .starts_with("organomagnesium_formation/")
+            || reaction
+                .reactants
+                .iter()
+                .all(|term| term.substance_id != tert_butyl_chloride)
+    }));
+
+    dynamic.to_registry().unwrap();
 }
 
 #[test]
@@ -1017,8 +1550,8 @@ fn generated_registry_builds_without_duplicate_derived_substances() {
 
 #[test]
 fn active_destroy_generic_reactions_are_accounted_for() {
-    assert_eq!(ACTIVE_DESTROY_GENERIC_REACTIONS.len(), 42);
-    assert_eq!(EXCLUDED_DESTROY_GENERIC_REACTIONS.len(), 3);
+    assert_eq!(ACTIVE_DESTROY_GENERIC_REACTIONS.len(), 43);
+    assert_eq!(EXCLUDED_DESTROY_GENERIC_REACTIONS.len(), 2);
 
     let registry = generated_registry();
     for prefix in ACTIVE_DESTROY_GENERIC_REACTIONS {
@@ -1271,6 +1804,51 @@ fn electrophilic_addition_generators_are_registered() {
     }
     let hydrogenation = reaction_with_prefix(&registry, "alkene_hydrogenation/destroy_ethene/");
     assert!(!hydrogenation.external_catalysts.is_empty());
+}
+
+#[test]
+fn alkene_hydration_generates_branched_alcohols_as_a_family() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let isobutene = dynamic.resolve_frowns("C=C(C)C").unwrap();
+    dynamic
+        .generate_reactions_for_substances([SubstanceId::from("destroy:propene"), isobutene], 1)
+        .unwrap();
+
+    let propene_hydration = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("alkene_hydrolysis/destroy_propene/")
+        })
+        .expect("propene must hydrate through the general alkene addition generator");
+    assert!(propene_hydration
+        .reactants
+        .iter()
+        .any(|term| term.substance_id == SubstanceId::from("destroy:water")));
+    assert_eq!(
+        propene_hydration
+            .orders
+            .get(&SubstanceId::from("destroy:proton")),
+        Some(&2)
+    );
+    let propene_products = reaction_product_ids(propene_hydration);
+    assert!(
+        propene_products.contains(&SubstanceId::from("destroy:isopropanol")),
+        "propene hydration products: {propene_products:?}"
+    );
+
+    let tert_butanol_reaction = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction.id.as_str().starts_with("alkene_hydrolysis/")
+                && reaction_product_ids(reaction)
+                    .contains(&SubstanceId::from("destroy:tert_butanol"))
+        })
+        .expect("dynamic branched alkene must hydrate to tert-butanol");
+    assert!(tert_butanol_reaction.display_as_reversible);
 }
 
 #[test]
@@ -2115,6 +2693,29 @@ fn tms_deprotection_restores_original_alcohol() {
 }
 
 #[test]
+fn non_tms_silyl_ether_does_not_use_tms_deprotection_path() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let non_tms = dynamic.resolve_frowns("O(C)(Si(C)(C)(C(Cl)))").unwrap();
+
+    dynamic
+        .generate_reactions_for_substances([non_tms.clone()], 1)
+        .unwrap();
+
+    assert!(!dynamic.reactions().any(|reaction| {
+        reaction
+            .id
+            .as_str()
+            .starts_with("silyl_ether_deprotection/")
+            && reaction
+                .reactants
+                .iter()
+                .any(|term| term.substance_id == non_tms)
+    }));
+    dynamic.to_registry().unwrap();
+}
+
+#[test]
 fn acetal_hydrolysis_restores_carbonyl_and_concrete_alcohols() {
     let mut dynamic =
         super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
@@ -2843,6 +3444,132 @@ fn diels_alder_closes_a_cyclohexene_from_butadiene_and_ethylene() {
     assert_eq!(
         carbon_carbon_bonds, 6,
         "cyclohexene ring has six carbon-carbon bonds"
+    );
+
+    dynamic.to_registry().unwrap();
+}
+
+#[test]
+fn alkene_photocycloaddition_closes_a_cyclobutane_from_two_alkenes() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let ethylene = dynamic.resolve_frowns("C=C").unwrap();
+    dynamic.generate_reactions_for(&ethylene, 1).unwrap();
+
+    let cycloaddition = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("alkene_photocycloaddition/")
+        })
+        .expect("ethylene must photochemically dimerize to a cyclobutane");
+    assert!(cycloaddition.requires_uv);
+    assert_eq!(cycloaddition.reactants.len(), 1);
+    assert_eq!(cycloaddition.reactants[0].substance_id, ethylene);
+    assert_eq!(cycloaddition.reactants[0].coefficient, 2);
+    assert_eq!(cycloaddition.products.len(), 1);
+
+    let product = dynamic
+        .substance(&cycloaddition.products[0].substance_id)
+        .unwrap();
+    let structure = product.molecular_structure.as_ref().unwrap();
+    assert_eq!(
+        structure
+            .atoms
+            .iter()
+            .filter(|atom| atom.element == "C")
+            .count(),
+        4
+    );
+    assert_eq!(
+        structure
+            .bonds
+            .iter()
+            .filter(|bond| crate::chemistry::molecule::bond_order_matches(bond.order, 2.0))
+            .count(),
+        0
+    );
+    assert_eq!(
+        structure
+            .bonds
+            .iter()
+            .filter(|bond| structure.atoms[bond.from].element == "C"
+                && structure.atoms[bond.to].element == "C")
+            .count(),
+        4
+    );
+
+    dynamic.to_registry().unwrap();
+}
+
+#[test]
+fn alkene_photocycloaddition_handles_substituted_alkenes_as_a_family() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let ethylene = dynamic.resolve_frowns("C=C").unwrap();
+    let propene = dynamic.resolve_frowns("C=CC").unwrap();
+    dynamic
+        .generate_reactions_for_substances([ethylene.clone(), propene.clone()], 1)
+        .unwrap();
+
+    let cycloaddition = dynamic
+        .reactions()
+        .find(|reaction| {
+            reaction
+                .id
+                .as_str()
+                .starts_with("alkene_photocycloaddition/")
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == ethylene)
+                && reaction
+                    .reactants
+                    .iter()
+                    .any(|term| term.substance_id == propene)
+        })
+        .expect("ethylene and propene must photochemically form a substituted cyclobutane");
+    let product = dynamic
+        .substance(&cycloaddition.products[0].substance_id)
+        .unwrap();
+    let structure = product.molecular_structure.as_ref().unwrap();
+    assert_eq!(
+        structure
+            .atoms
+            .iter()
+            .filter(|atom| atom.element == "C")
+            .count(),
+        5
+    );
+    assert!(cycloaddition.requires_uv);
+
+    dynamic.to_registry().unwrap();
+}
+
+#[test]
+fn alkene_photocycloaddition_rejects_alkynes() {
+    let mut dynamic =
+        super::super::dynamic::DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+    let ethylene = dynamic.resolve_frowns("C=C").unwrap();
+    let acetylene = dynamic.resolve_frowns("C#C").unwrap();
+    dynamic
+        .generate_reactions_for_substances([ethylene.clone(), acetylene.clone()], 1)
+        .unwrap();
+
+    assert!(
+        dynamic.reactions().all(|reaction| {
+            !reaction
+                .id
+                .as_str()
+                .starts_with("alkene_photocycloaddition/")
+                || reaction
+                    .reactants
+                    .iter()
+                    .all(|term| term.substance_id != acetylene)
+        }),
+        "an alkyne must not be accepted by the alkene [2+2] generator"
     );
 
     dynamic.to_registry().unwrap();

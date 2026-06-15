@@ -49,6 +49,10 @@ enum OrganicGeneratorKind {
     AlcoholDehydration,
     KetoEnolTautomerization,
     ThionylChlorideSubstitution,
+    AlcoholHydrohalogenation,
+    AlcoholChloroformateFormation,
+    ChloroformateAlcoholCarbonateFormation,
+    ChloroformateAmineCarbamateFormation,
     CarboxylicAcidEsterification,
     AcylChlorideEsterification,
     AlkoxideProtonation,
@@ -72,6 +76,7 @@ enum OrganicGeneratorKind {
     IsocyanateHydrolysis,
     IsocyanateAmmonolysis,
     IsocyanateAmineAddition,
+    BorateEsterification,
     BoraneOxidation,
     BorateEsterHydrolysis,
     AlkeneChlorination,
@@ -79,10 +84,12 @@ enum OrganicGeneratorKind {
     AlkeneHydrolysis,
     AlkeneHydroborationWithBorane,
     AlkeneHydrochlorination,
+    AlkeneHydrocyanation,
     AlkeneHydrogenation,
     AlkeneHydroiodination,
     AlkeneIodination,
     AlkenePhotoisomerization,
+    AlkenePhotocycloaddition,
     AlkeneEpoxidation,
     ChainGrowthPolymerization,
     DielsAlder,
@@ -92,6 +99,7 @@ enum OrganicGeneratorKind {
     AlkyneHydrolysis,
     AlkyneHydroborationWithBorane,
     AlkyneHydrochlorination,
+    AlkyneHydrocyanation,
     AlkyneHydrogenation,
     AlkyneHydroiodination,
     AlkyneIodination,
@@ -400,7 +408,7 @@ impl DynamicChemistryRegistry {
     ) -> ChemistryResult<DynamicGenerationReport> {
         self.substance(substance_id)?;
         let seeds = vec![self.known_substance_index_or_error(substance_id)?];
-        self.generate_reactions_from_scope(seeds, max_iterations)
+        self.generate_reactions_from_scope(seeds.clone(), seeds, max_iterations)
     }
 
     pub fn generate_reactions_for_substances(
@@ -409,19 +417,32 @@ impl DynamicChemistryRegistry {
         max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
         let seeds = self.validated_substance_indices(substance_ids)?;
-        self.generate_reactions_from_scope(seeds, max_iterations)
+        self.generate_reactions_from_scope(seeds.clone(), seeds, max_iterations)
+    }
+
+    pub fn generate_reactions_for_substances_in_scope(
+        &mut self,
+        seed_substance_ids: impl IntoIterator<Item = SubstanceId>,
+        scope_substance_ids: impl IntoIterator<Item = SubstanceId>,
+        max_iterations: usize,
+    ) -> ChemistryResult<DynamicGenerationReport> {
+        let seeds = self.validated_substance_indices(seed_substance_ids)?;
+        let scope = self.validated_substance_indices(scope_substance_ids)?;
+        self.generate_reactions_from_scope(seeds, scope, max_iterations)
     }
 
     pub fn generate_reactions(
         &mut self,
         max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
-        self.generate_reactions_from_scope(self.all_known_substance_indices(), max_iterations)
+        let seeds = self.all_known_substance_indices();
+        self.generate_reactions_from_scope(seeds.clone(), seeds, max_iterations)
     }
 
     fn generate_reactions_from_scope(
         &mut self,
         seeds: Vec<KnownSubstanceIndex>,
+        scope_indices: Vec<KnownSubstanceIndex>,
         max_iterations: usize,
     ) -> ChemistryResult<DynamicGenerationReport> {
         if max_iterations == 0 {
@@ -438,6 +459,9 @@ impl DynamicChemistryRegistry {
         let mut queue = VecDeque::new();
         let mut queued = vec![false; self.known_substance_count()];
         let mut scope = vec![false; self.known_substance_count()];
+        for scope_index in scope_indices {
+            self.mark_known_substance(&mut scope, scope_index, true);
+        }
         for seed in seeds {
             self.mark_known_substance(&mut scope, seed, true);
             enqueue_known_substance(
@@ -1761,6 +1785,8 @@ fn generators_for_site(
             OrganicGeneratorKind::AlcoholDehydration,
             OrganicGeneratorKind::KetoEnolTautomerization,
             OrganicGeneratorKind::ThionylChlorideSubstitution,
+            OrganicGeneratorKind::AlcoholHydrohalogenation,
+            OrganicGeneratorKind::AlcoholChloroformateFormation,
             OrganicGeneratorKind::AlcoholSilylProtection,
             OrganicGeneratorKind::CarboxylicAcidEsterification,
             OrganicGeneratorKind::AcylChlorideEsterification,
@@ -1786,6 +1812,10 @@ fn generators_for_site(
             OrganicGeneratorKind::AcylChlorideAmidation,
             OrganicGeneratorKind::AcylChlorideThioesterification,
             OrganicGeneratorKind::FriedelCraftsAcylation,
+        ],
+        ReactiveSiteKind::Chloroformate => &[
+            OrganicGeneratorKind::ChloroformateAlcoholCarbonateFormation,
+            OrganicGeneratorKind::ChloroformateAmineCarbamateFormation,
         ],
         ReactiveSiteKind::AcidAnhydride => &[
             OrganicGeneratorKind::AcidAnhydrideHydrolysis,
@@ -1885,6 +1915,7 @@ fn generators_for_site(
             OrganicGeneratorKind::IsocyanateAmmonolysis,
             OrganicGeneratorKind::IsocyanateAmineAddition,
         ],
+        ReactiveSiteKind::BoricAcid => &[OrganicGeneratorKind::BorateEsterification],
         ReactiveSiteKind::Borane => &[OrganicGeneratorKind::BoraneOxidation],
         ReactiveSiteKind::BorateEster => &[OrganicGeneratorKind::BorateEsterHydrolysis],
         ReactiveSiteKind::Alkene => &[
@@ -1893,12 +1924,14 @@ fn generators_for_site(
             OrganicGeneratorKind::AlkeneHydrolysis,
             OrganicGeneratorKind::AlkeneHydroborationWithBorane,
             OrganicGeneratorKind::AlkeneHydrochlorination,
+            OrganicGeneratorKind::AlkeneHydrocyanation,
             OrganicGeneratorKind::AlkeneHydrogenation,
             OrganicGeneratorKind::AlkeneHydroiodination,
             OrganicGeneratorKind::AlkeneIodination,
             OrganicGeneratorKind::AlkeneEpoxidation,
             OrganicGeneratorKind::MichaelAddition,
             OrganicGeneratorKind::AlkenePhotoisomerization,
+            OrganicGeneratorKind::AlkenePhotocycloaddition,
             OrganicGeneratorKind::ChainGrowthPolymerization,
             OrganicGeneratorKind::DielsAlder,
             OrganicGeneratorKind::RetroDielsAlder,
@@ -1909,6 +1942,7 @@ fn generators_for_site(
             OrganicGeneratorKind::AlkyneHydrolysis,
             OrganicGeneratorKind::AlkyneHydroborationWithBorane,
             OrganicGeneratorKind::AlkyneHydrochlorination,
+            OrganicGeneratorKind::AlkyneHydrocyanation,
             OrganicGeneratorKind::AlkyneHydrogenation,
             OrganicGeneratorKind::AlkyneHydroiodination,
             OrganicGeneratorKind::AlkyneIodination,
@@ -2472,6 +2506,16 @@ fn conjugate_base_for_group(
                 ))
             })
         }
+        FunctionalGroupType::AromatizingCarbonAcid => {
+            let carbon = group_atom(group, 0, substance_id, "aromatizing carbon acid center")?;
+            let proton = group_atom(group, 1, substance_id, "aromatizing carbon acid proton")?;
+            deprotonated_structure(structure, carbon, proton, -1.0).map(|structure| {
+                Some((
+                    structure,
+                    estimated_acid_pka(FunctionalGroupType::AromatizingCarbonAcid),
+                ))
+            })
+        }
         _ => Ok(None),
     }
 }
@@ -2512,6 +2556,7 @@ fn estimated_acid_pka(group_type: FunctionalGroupType) -> f64 {
     match group_type {
         FunctionalGroupType::CarboxylicAcid => 4.8,
         FunctionalGroupType::BoricAcid => 9.2,
+        FunctionalGroupType::AromatizingCarbonAcid => 16.0,
         _ => unreachable!("only acid functional groups have estimated pKa values"),
     }
 }
@@ -3003,6 +3048,30 @@ mod tests {
 
         assert!(mixture.ph(&registry).unwrap().is_some_and(|ph| ph < 7.0));
         assert!(mixture.concentration_of(&spec.conjugate_base) > 0.0);
+    }
+
+    #[test]
+    fn dynamic_aromatizing_carbon_acid_creates_cyclopentadienyl_base() {
+        let mut dynamic = DynamicChemistryRegistry::from_destroy_catalog().unwrap();
+        let acid = dynamic
+            .resolve_frowns(
+                "destroy:graph:atoms=C.C.C.C.C.H.H.H.H.H.H;\
+                 bonds=0-d-1,1-s-2,2-d-3,3-s-4,4-s-0,\
+                 0-s-5,1-s-6,2-s-7,3-s-8,4-s-9,4-s-10",
+            )
+            .unwrap();
+        let spec = dynamic
+            .dynamic_acid_base_specs
+            .iter()
+            .find(|spec| spec.acid == acid)
+            .expect("aromatizing carbon acid must register acidity")
+            .clone();
+
+        assert_eq!(
+            spec.conjugate_base,
+            SubstanceId::from("destroy:cyclopentadienide")
+        );
+        assert!((spec.pka - 16.0).abs() < 1.0e-9);
     }
 
     #[test]
