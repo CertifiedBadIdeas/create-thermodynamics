@@ -1,0 +1,37 @@
+package dev.makargravanov.create_thermodynamics.common.reactor.multiblock.runtime
+
+import dev.makargravanov.create_thermodynamics.common.reactor.multiblock.model.ReactorMultiblockDefinition
+import dev.makargravanov.create_thermodynamics.common.reactor.multiblock.model.ReactorPortDescriptor
+
+interface NativeReactorBridge {
+    fun createNativeReactor(definition: ReactorMultiblockDefinition): NativeReactorMultiblockBinding
+
+    fun createNativeReactorFromCheckpoint(
+        definition: ReactorMultiblockDefinition,
+        encodedCheckpoint: ByteArray,
+    ): NativeReactorMultiblockBinding
+
+    fun removeNativeReactor(binding: NativeReactorMultiblockBinding)
+
+    fun tickNativeReactor(binding: NativeReactorMultiblockBinding, dtSeconds: Double)
+
+    fun exportReactorCheckpoint(
+        binding: NativeReactorMultiblockBinding,
+        contentVersion: Long,
+    ): ByteArray
+
+    fun insertItemStack(
+        binding: NativeReactorMultiblockBinding,
+        itemInputPort: ReactorPortDescriptor,
+        itemId: String,
+        itemCount: Int,
+    ): Int
+
+    fun extractItemStack(
+        binding: NativeReactorMultiblockBinding,
+        itemOutputPort: ReactorPortDescriptor,
+        itemId: String,
+        maxItemCount: Int,
+        dtSeconds: Double,
+    ): Int
+}

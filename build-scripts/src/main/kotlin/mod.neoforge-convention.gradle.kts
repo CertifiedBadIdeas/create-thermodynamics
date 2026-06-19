@@ -26,6 +26,11 @@ base {
     archivesName.set(prop("mod_id"))
 }
 
+repositories {
+    maven("https://maven.createmod.net")
+    maven("https://maven.ithundxr.dev/snapshots")
+}
+
 extensions.configure<NeoForgeExtension>("neoForge") {
     version = prop("neo_version")
 
@@ -72,6 +77,9 @@ extensions.configure<NeoForgeExtension>("neoForge") {
 
     mods {
         register(prop("mod_id")) {
+            sourceSet(project(":modules:core").sourceSets.main.get())
+            sourceSet(project(":modules:ui").sourceSets.main.get())
+            sourceSet(project(":modules:v1_21_1:v1_21_1-common").sourceSets.main.get())
             sourceSet(sourceSets.main.get())
         }
     }
@@ -92,8 +100,16 @@ configurations {
     }
 }
 
+dependencies {
+    add("additionalRuntimeClasspath", kotlin("stdlib"))
+    add("additionalRuntimeClasspath", "ru.lazyhat:kraft-ui-dsl")
+    add("jarJar", kotlin("stdlib"))
+    add("jarJar", "ru.lazyhat:kraft-ui-dsl")
+}
+
 tasks.named<Jar>("jar") {
     from(project(":modules:core").sourceSets.main.get().output)
+    from(project(":modules:ui").sourceSets.main.get().output)
     from(project(":modules:v1_21_1:v1_21_1-common").sourceSets.main.get().output)
 }
 

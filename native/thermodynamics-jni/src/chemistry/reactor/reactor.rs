@@ -9,19 +9,19 @@ use super::zone::ReactorZone;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ZoneId(pub usize);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubstanceEntry {
     pub id: SubstanceId,
     pub rate_mol_per_second: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhaseEntry {
     pub phase: MixturePhase,
     pub rate_mol_per_second: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TransitionMode {
     Substances {
         entries: Vec<SubstanceEntry>,
@@ -38,7 +38,7 @@ pub enum TransitionMode {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ZoneTransition {
     pub from: ZoneId,
     pub to: ZoneId,
@@ -62,7 +62,7 @@ impl ZoneTransition {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Input {
     pub to: ZoneId,
     pub mode: TransitionMode,
@@ -84,7 +84,7 @@ impl Input {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Output {
     pub from: ZoneId,
     pub mode: TransitionMode,
@@ -131,6 +131,62 @@ impl Reactor {
             vle_iterations: 1,
             vle_relaxation: 1.0,
         }
+    }
+
+    pub fn from_parts(
+        zones: Vec<ReactorZone>,
+        transitions: Vec<ZoneTransition>,
+        inputs: Vec<Input>,
+        outputs: Vec<Output>,
+        ambient_temperature_kelvin: Option<f64>,
+        heat_transfer_coefficient_kw_per_kelvin: Option<f64>,
+        last_ambient_energy_exchange_j: f64,
+        vle_iterations: usize,
+        vle_relaxation: f64,
+    ) -> ChemistryResult<Self> {
+        if let Some(temperature) = ambient_temperature_kelvin {
+            validate_optional_reactor_number("ambient temperature", temperature)?;
+        }
+        if let Some(coefficient) = heat_transfer_coefficient_kw_per_kelvin {
+            validate_optional_reactor_number("heat transfer coefficient", coefficient)?;
+        }
+        validate_optional_reactor_number(
+            "last ambient energy exchange",
+            last_ambient_energy_exchange_j,
+        )?;
+        if vle_iterations == 0 {
+            return Err(ChemistryError::InvalidMixtureState(
+                "vle iterations must be greater than zero".to_string(),
+            ));
+        }
+        if !vle_relaxation.is_finite() || !(0.01..=1.0).contains(&vle_relaxation) {
+            return Err(ChemistryError::InvalidMixtureState(format!(
+                "vle relaxation must be finite and in 0.01..=1.0, got {vle_relaxation}"
+            )));
+        }
+        let zone_count = zones.len();
+        for transition in &transitions {
+            validate_zone_id("transition source", transition.from, zone_count)?;
+            validate_zone_id("transition target", transition.to, zone_count)?;
+        }
+        for input in &inputs {
+            validate_zone_id("input target", input.to, zone_count)?;
+        }
+        for output in &outputs {
+            validate_zone_id("output source", output.from, zone_count)?;
+        }
+        let reactor = Self {
+            zones,
+            transitions,
+            inputs,
+            outputs,
+            ambient_temperature_kelvin,
+            heat_transfer_coefficient_kw_per_kelvin,
+            last_ambient_energy_exchange_j,
+            vle_iterations,
+            vle_relaxation,
+        };
+        Ok(reactor)
     }
 
     pub fn set_vle_iterations(&mut self, iterations: usize) {
@@ -201,6 +257,10 @@ impl Reactor {
         self.zones.len()
     }
 
+    pub fn zones(&self) -> &[ReactorZone] {
+        &self.zones
+    }
+
     pub fn add_transition(&mut self, transition: ZoneTransition) -> usize {
         self.transitions.push(transition);
         self.transitions.len() - 1
@@ -269,15 +329,19 @@ impl Reactor {
             )?;
         }
         for zone in &mut self.zones {
-            zone.tick(registry, dt_seconds);
+            zone.tick(registry, dt_seconds)?;
         }
         for _ in 0..self.vle_iterations {
             for zone in &mut self.zones {
                 zone.mixture_mut()
                     .equilibrate_vapor_liquid(registry, self.vle_relaxation)?;
+                zone.refresh_headspace_volume(registry)?;
             }
         }
         self.apply_ambient_heat_exchange(registry, dt_seconds)?;
+        for zone in &mut self.zones {
+            zone.refresh_headspace_volume(registry)?;
+        }
         Ok(())
     }
 
@@ -320,7 +384,7 @@ impl Reactor {
             let energy = energy_to_equilibrium.clamp(-max_energy, max_energy);
 
             if energy.abs() > 1.0e-12 {
-                let _ = zone.mixture_mut().heat(registry, energy);
+                zone.mixture_mut().heat(registry, energy)?;
                 total_energy_j += energy;
             }
         }
@@ -415,8 +479,14 @@ impl Reactor {
                     let max_amount = entry.rate_mol_per_second * dt_seconds;
                     let take = available.min(max_amount);
                     if take > 0.0 {
-                        io::extract_substance(&mut self.zones[from.0], registry, &entry.id, take)?;
-                        io::insert_substance(&mut self.zones[to.0], registry, &entry.id, take)?;
+                        if let Some(stream) = io::extract_substance_stream(
+                            &mut self.zones[from.0],
+                            registry,
+                            &entry.id,
+                            take,
+                        )? {
+                            io::insert_stream(&mut self.zones[to.0], registry, &stream)?;
+                        }
                     }
                 }
             }
@@ -426,15 +496,15 @@ impl Reactor {
                     if max_amount <= 0.0 {
                         continue;
                     }
-                    io::extract_from_phase(
+                    io::extract_from_phase_streams(
                         &mut self.zones[from.0],
                         registry,
                         entry.phase,
                         max_amount,
                     )?
                     .into_iter()
-                    .try_for_each(|(id, amount)| -> ChemistryResult<()> {
-                        io::insert_substance(&mut self.zones[to.0], registry, &id, amount)?;
+                    .try_for_each(|stream| -> ChemistryResult<()> {
+                        io::insert_stream(&mut self.zones[to.0], registry, &stream)?;
                         Ok(())
                     })?;
                 }
@@ -459,19 +529,13 @@ impl Reactor {
                 for component in &snapshot.substances {
                     let take = component.total_mol_per_bucket * scale;
                     if take > 0.0 {
-                        let amount = io::extract_substance(
+                        if let Some(stream) = io::extract_substance_stream(
                             &mut self.zones[from.0],
                             registry,
                             &component.id,
                             take,
-                        )?;
-                        if amount > 0.0 {
-                            io::insert_substance(
-                                &mut self.zones[to.0],
-                                registry,
-                                &component.id,
-                                amount,
-                            )?;
+                        )? {
+                            io::insert_stream(&mut self.zones[to.0], registry, &stream)?;
                         }
                     }
                 }
@@ -489,8 +553,14 @@ impl Reactor {
                     let max_amount = entry.rate_mol_per_second * dt_seconds;
                     let take = excess.min(max_amount);
                     if take > 0.0 {
-                        io::extract_substance(&mut self.zones[from.0], registry, &entry.id, take)?;
-                        io::insert_substance(&mut self.zones[to.0], registry, &entry.id, take)?;
+                        if let Some(stream) = io::extract_substance_stream(
+                            &mut self.zones[from.0],
+                            registry,
+                            &entry.id,
+                            take,
+                        )? {
+                            io::insert_stream(&mut self.zones[to.0], registry, &stream)?;
+                        }
                     }
                 }
             }
@@ -599,3 +669,24 @@ impl Reactor {
 }
 
 use crate::chemistry::error::ChemistryError;
+
+fn validate_zone_id(name: &str, zone_id: ZoneId, zone_count: usize) -> ChemistryResult<()> {
+    if zone_id.0 < zone_count {
+        Ok(())
+    } else {
+        Err(ChemistryError::InvalidMixtureState(format!(
+            "{name} zone index {} out of range (have {zone_count})",
+            zone_id.0
+        )))
+    }
+}
+
+fn validate_optional_reactor_number(name: &str, value: f64) -> ChemistryResult<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ChemistryError::InvalidMixtureState(format!(
+            "{name} must be finite, got {value}"
+        )))
+    }
+}
