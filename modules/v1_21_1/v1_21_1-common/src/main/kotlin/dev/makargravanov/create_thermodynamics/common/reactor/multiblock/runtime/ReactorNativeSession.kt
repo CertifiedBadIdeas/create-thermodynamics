@@ -23,16 +23,17 @@ class ReactorNativeSession(
         command: ReactorCommand,
         batchVersions: MutableMap<ReactorStructureId, ReactorSnapshotVersion>,
     ): ReactorReport {
-        val current = currentSnapshotVersion(command, batchVersions)
-        if (current == null) {
+        val stored = structures.record(command.structureId)?.snapshotVersion
+        if (stored == null) {
             return rejected(command, ReactorSnapshotVersion(0), "reactor structure ${command.structureId.value} is not registered")
         }
+        val current = batchVersions[command.structureId] ?: stored
         val expected = command.expectedSnapshotVersion
-        if (expected != null && expected != current) {
+        if (expected != null && expected != stored) {
             return rejected(
                 command,
                 current,
-                "reactor command ${command.commandId.value} expected snapshot ${expected.value}, current snapshot is ${current.value}",
+                "reactor command ${command.commandId.value} expected snapshot ${expected.value}, stored snapshot is ${stored.value}",
             )
         }
 
@@ -110,17 +111,23 @@ class ReactorNativeSession(
         val next = current.next()
         return when (val result = structures.tick(command.structureId, command.dtSeconds)) {
             is ReactorOperationResult.Completed -> {
+                val metrics = when (val metricsResult = structures.readZoneMetrics(
+                    structureId = command.structureId,
+                    zoneIndex = 0,
+                    simulatedSeconds = command.dtSeconds,
+                )) {
+                    is ReactorOperationResult.ReactorMetricsRead -> metricsResult.metrics
+                    else -> {
+                        return rejected(command, current, metricsResult.message())
+                    }
+                }
                 batchVersions[command.structureId] = next
                 ReactorReport.TickCompleted(
                     reportId = nextReportId(),
                     commandId = command.commandId,
                     structureId = command.structureId,
                     snapshotVersion = next,
-                    metrics = ReactorTickMetrics(
-                        simulatedSeconds = command.dtSeconds,
-                        temperatureKelvin = null,
-                        pressurePascal = null,
-                    ),
+                    metrics = metrics,
                 )
             }
             else -> rejected(command, current, result.message())
@@ -219,12 +226,6 @@ class ReactorNativeSession(
         }
     }
 
-    private fun currentSnapshotVersion(
-        command: ReactorCommand,
-        batchVersions: Map<ReactorStructureId, ReactorSnapshotVersion>,
-    ): ReactorSnapshotVersion? =
-        batchVersions[command.structureId] ?: structures.record(command.structureId)?.snapshotVersion
-
     private fun accepted(
         command: ReactorCommand,
         snapshotVersion: ReactorSnapshotVersion,
@@ -263,6 +264,7 @@ class ReactorNativeSession(
             is ReactorOperationResult.ReactorSuspended -> message
             is ReactorOperationResult.ReactorResumed -> message
             is ReactorOperationResult.ReactorCheckpointExported -> "reactor checkpoint exported to ${checkpoint.storageKey}"
+            is ReactorOperationResult.ReactorMetricsRead -> "reactor metrics read"
             is ReactorOperationResult.Rejected -> message
             is ReactorOperationResult.Failed -> message
         }

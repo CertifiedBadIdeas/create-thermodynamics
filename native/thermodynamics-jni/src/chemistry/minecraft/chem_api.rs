@@ -10,7 +10,9 @@ use crate::chemistry::minecraft::protocol::blob::NativeBlobLimits;
 use crate::chemistry::minecraft::protocol::catalog_snapshot::{
     export_dynamic_catalog_checkpoint, import_dynamic_catalog_checkpoint,
 };
-use crate::chemistry::minecraft::worker::reactors_worker::{ReactorInstanceId, ReactorsWorker};
+use crate::chemistry::minecraft::worker::reactors_worker::{
+    ReactorInstanceId, ReactorZoneSnapshot, ReactorsWorker,
+};
 use crate::chemistry::reactor::{Input, Output, Reactor, ReactorZone, TransitionMode};
 use crate::chemistry::registry::ChemistryRegistry;
 use crate::chemistry::substance::SubstanceId;
@@ -193,6 +195,17 @@ pub fn tick_reactor(reactor_id: ReactorInstanceId, dt_seconds: f64) -> Chemistry
     })
 }
 
+pub fn reactor_zone_snapshot(
+    reactor_id: ReactorInstanceId,
+    zone_index: usize,
+) -> ChemistryResult<ReactorZoneSnapshot> {
+    with_minecraft_chemistry_state(|state| {
+        state
+            .reactors_worker
+            .reactor_zone_snapshot(reactor_id, zone_index)
+    })
+}
+
 pub fn insert_item_stack_to_reactor_input(
     reactor_id: ReactorInstanceId,
     input_index: usize,
@@ -327,8 +340,20 @@ fn registration_error_to_chemistry_error(error: RegistrationError) -> ChemistryE
 mod tests {
     use super::*;
 
+    static CHEM_API_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn lock_chem_api_test_state() -> std::sync::MutexGuard<'static, ()> {
+        CHEM_API_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn item_bindings_are_replaced_atomically() {
+        let _guard = lock_chem_api_test_state();
+
         replace_item_chemical_bindings(vec![ItemChemicalBinding::new(
             "minecraft:water_bucket",
             "destroy:water",
@@ -352,6 +377,8 @@ mod tests {
 
     #[test]
     fn clearing_item_bindings_removes_all_entries() {
+        let _guard = lock_chem_api_test_state();
+
         replace_item_chemical_bindings(vec![ItemChemicalBinding::new(
             "minecraft:water_bucket",
             "destroy:water",
@@ -375,6 +402,8 @@ mod tests {
 
     #[test]
     fn catalog_checkpoint_exports_and_imports_through_chem_api() {
+        let _guard = lock_chem_api_test_state();
+
         let encoded = export_catalog_checkpoint(42).unwrap();
 
         import_catalog_checkpoint(&encoded).unwrap();

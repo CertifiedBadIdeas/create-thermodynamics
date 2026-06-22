@@ -1,6 +1,5 @@
 import buildlogic.CheckArchitectureBoundaryTask
 import buildlogic.GenerateReactorChamberAssetsTask
-import buildlogic.GenerateReactorControllerUiProgramTask
 
 plugins {
     id("mod.neoforge-convention")
@@ -12,9 +11,8 @@ fun modProperty(name: String): String =
     requireNotNull(modProperties[name]?.toString()) { "Missing '$name' in mod properties" }
 
 dependencies {
-    implementation(project(":modules:v1_21_1:v1_21_1-common"))
     implementation(project(":modules:ui"))
-    implementation("ru.lazyhat:kraft-ui-dsl")
+    implementation(project(":modules:v1_21_1:v1_21_1-common"))
 
     implementation("com.simibubi.create:create-${modProperty("minecraft_version")}:${modProperty("create_version")}:slim") {
         isTransitive = false
@@ -26,17 +24,15 @@ dependencies {
 }
 
 val generatedResourcesRoot = layout.projectDirectory.dir("src/generated/resources")
-val generatedUiSourceRoot = layout.buildDirectory.dir("generated/source/reactor-ui/main/kotlin")
+val generatedUiKotlinRoot = project(":modules:ui").layout.buildDirectory.dir("generated/kraftui/neoforge/kotlin")
+val generatedUiResourcesRoot = project(":modules:ui").layout.buildDirectory.dir("generated/kraftui/neoforge/resources")
+val generateReactorControllerMinecraftUi = ":modules:ui:generateReactorControllerMinecraftUi"
 
-val generateReactorControllerUiProgram by tasks.registering(GenerateReactorControllerUiProgramTask::class) {
-    group = LifecycleBasePlugin.BUILD_GROUP
-    description = "Generates precompiled reactor controller UI program for Minecraft runtime."
-
-    outputDirectory.set(generatedUiSourceRoot)
-}
-
-sourceSets.main {
-    kotlin.srcDir(generatedUiSourceRoot)
+sourceSets {
+    main {
+        kotlin.srcDir(generatedUiKotlinRoot)
+        resources.srcDir(generatedUiResourcesRoot)
+    }
 }
 
 val generateReactorChamberAssets by tasks.registering(GenerateReactorChamberAssetsTask::class) {
@@ -53,10 +49,11 @@ val generateReactorChamberAssets by tasks.registering(GenerateReactorChamberAsse
 
 tasks.named("processResources") {
     dependsOn(generateReactorChamberAssets)
+    dependsOn(generateReactorControllerMinecraftUi)
 }
 
 tasks.named("compileKotlin") {
-    dependsOn(generateReactorControllerUiProgram)
+    dependsOn(generateReactorControllerMinecraftUi)
 }
 
 tasks.register<CheckArchitectureBoundaryTask>("checkThinLoaderBoundary") {
@@ -66,7 +63,13 @@ tasks.register<CheckArchitectureBoundaryTask>("checkThinLoaderBoundary") {
     sourceRoot.set(layout.projectDirectory.dir("src/main/kotlin"))
     forbiddenImports.set(emptyList())
     forbiddenPathSegments.set(listOf("/content/", "\\content\\"))
-    forbiddenText.set(listOf("ScreenProgramCompiler"))
+    forbiddenText.set(
+        listOf(
+            "ScreenProgramCompiler",
+            "ScreenRuntimeExecutor",
+            "ru.lazyhat.kraftui",
+        ),
+    )
     failureMessage.set("NeoForge loader module must not contain content packages")
 }
 

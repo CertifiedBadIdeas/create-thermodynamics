@@ -1,106 +1,145 @@
 package dev.makargravanov.create_thermodynamics.neoforge.client
 
+import com.simibubi.create.foundation.gui.menu.AbstractSimiContainerScreen
 import dev.makargravanov.create_thermodynamics.common.reactor.multiblock.world.ReactorControllerFormationState
+import dev.makargravanov.create_thermodynamics.common.reactor.multiblock.world.ReactorControllerViewState
+import dev.makargravanov.create_thermodynamics.common.reactor.multiblock.world.ReactorZoneViewState
 import dev.makargravanov.create_thermodynamics.neoforge.block.ReactorControllerMenu
-import dev.makargravanov.create_thermodynamics.neoforge.client.generated.GeneratedReactorControllerProgram
-import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorControllerUiState
+import dev.makargravanov.create_thermodynamics.neoforge.block.ReactorMultiblockBlockEntity
+import dev.makargravanov.create_thermodynamics.neoforge.client.generated.GeneratedReactorControllerScreen
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorControllerAction
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorControllerTab
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorControllerUiSnapshot
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorControllerUiSize
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorMixtureUiLine
+import dev.makargravanov.create_thermodynamics.ui.reactor.ReactorZoneUiSnapshot
 import net.minecraft.client.gui.GuiGraphics
-import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
 import net.minecraft.network.chat.Component
 import net.minecraft.world.entity.player.Inventory
-import ru.lazyhat.kraftui.program.ScreenRuntimeExecutor
+import java.util.Locale
 
 class ReactorControllerScreen(
     menu: ReactorControllerMenu,
     playerInventory: Inventory,
     title: Component,
-) : AbstractContainerScreen<ReactorControllerMenu>(menu, playerInventory, title) {
-    private var executor: ScreenRuntimeExecutor? = null
-
-    init {
-        imageWidth = GeneratedReactorControllerProgram.Width
-        imageHeight = GeneratedReactorControllerProgram.Height
-    }
+) : AbstractSimiContainerScreen<ReactorControllerMenu>(menu, playerInventory, title) {
+    private var selectedTab: ReactorControllerTab = ReactorControllerTab.Overview
+    private var selectedZoneIndex: Int = 0
+    private val generatedScreen = GeneratedReactorControllerScreen()
 
     override fun init() {
+        setWindowSize(ReactorControllerUiSize.Width, ReactorControllerUiSize.Height)
+        setWindowOffset(-16, 0)
         super.init()
-        rebuildUi()
+        clearWidgets()
     }
 
-    override fun render(graphics: GuiGraphics, mouseX: Int, mouseY: Int, partialTick: Float) {
-        renderBackground(graphics, mouseX, mouseY, partialTick)
-        val currentExecutor = executor ?: rebuildUi()
-        currentExecutor.updateMouse(mouseX, mouseY)
-        currentExecutor.render(MinecraftUiRenderBackend(graphics, font))
-        currentExecutor.activeTooltip?.let { tooltip ->
-            graphics.renderTooltip(font, Component.literal(tooltip), mouseX, mouseY)
-        }
+    override fun renderBg(
+        graphics: GuiGraphics,
+        partialTick: Float,
+        mouseX: Int,
+        mouseY: Int,
+    ) {
+        generatedScreen.render(graphics, generatedState(), leftPos, topPos)
     }
 
-    override fun renderBg(graphics: GuiGraphics, partialTick: Float, mouseX: Int, mouseY: Int) {
+    override fun renderForeground(
+        graphics: GuiGraphics,
+        mouseX: Int,
+        mouseY: Int,
+        partialTicks: Float,
+    ) {
+        super.renderForeground(graphics, mouseX, mouseY, partialTicks)
     }
 
-    override fun renderLabels(graphics: GuiGraphics, mouseX: Int, mouseY: Int) {
-    }
-
-    override fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean =
-        executor?.mouseClicked(mouseX.toInt(), mouseY.toInt()) == true || super.mouseClicked(mouseX, mouseY, button)
-
-    override fun mouseDragged(
+    override fun mouseClicked(
         mouseX: Double,
         mouseY: Double,
         button: Int,
-        dragX: Double,
-        dragY: Double,
-    ): Boolean =
-        executor?.mouseDragged(mouseX.toInt(), mouseY.toInt()) == true ||
-            super.mouseDragged(mouseX, mouseY, button, dragX, dragY)
+    ): Boolean {
+        if (button == 0) {
+            val action =
+                generatedScreen.mouseClicked(
+                    state = generatedState(),
+                    x = mouseX.toInt() - leftPos,
+                    y = mouseY.toInt() - topPos,
+                )
+            if (action != null) {
+                applyAction(action)
+                generatedScreen.clearDynamicCaches()
+                return true
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button)
+    }
 
-    override fun mouseReleased(mouseX: Double, mouseY: Double, button: Int): Boolean =
-        executor?.mouseReleased(mouseX.toInt(), mouseY.toInt()) == true || super.mouseReleased(mouseX, mouseY, button)
-
-    override fun mouseScrolled(mouseX: Double, mouseY: Double, scrollX: Double, scrollY: Double): Boolean =
-        executor?.mouseScrolled(mouseX.toInt(), mouseY.toInt(), scrollY) == true ||
-            super.mouseScrolled(mouseX, mouseY, scrollX, scrollY)
-
-    override fun keyPressed(keyCode: Int, scanCode: Int, modifiers: Int): Boolean =
-        executor?.keyPressed(keyCode, modifiers) == true || super.keyPressed(keyCode, scanCode, modifiers)
-
-    override fun keyReleased(keyCode: Int, scanCode: Int, modifiers: Int): Boolean =
-        executor?.keyReleased(keyCode) == true || super.keyReleased(keyCode, scanCode, modifiers)
-
-    override fun charTyped(codePoint: Char, modifiers: Int): Boolean =
-        executor?.charTyped(codePoint) == true || super.charTyped(codePoint, modifiers)
-
-    private fun rebuildUi(): ScreenRuntimeExecutor {
-        val program =
-            GeneratedReactorControllerProgram.create(
-                rootX = leftPos,
-                rootY = topPos,
-                state = ::uiState,
-            )
-        val previousFocus = executor?.focusedNodeId
-        return ScreenRuntimeExecutor(program).also { newExecutor ->
-            newExecutor.restoreFocus(previousFocus)
-            executor = newExecutor
+    private fun applyAction(action: ReactorControllerAction) {
+        when (action) {
+            is ReactorControllerAction.SelectTab -> selectedTab = action.tab
+            is ReactorControllerAction.SelectZone -> selectedZoneIndex = action.zoneIndex
         }
     }
 
-    private fun uiState(): ReactorControllerUiState {
-        val state = menu.state
-        val formed = state.formationState == ReactorControllerFormationState.FORMED
-        return ReactorControllerUiState(
+    private fun generatedState() =
+        controllerSnapshot().toGeneratedState(
+            selectedTab = selectedTab,
+            selectedZoneIndex = selectedZoneIndex,
+        )
+
+    private fun controllerSnapshot(): ReactorControllerUiSnapshot {
+        val state = controllerState()
+        return ReactorControllerUiSnapshot(
             title = title.string,
-            status = when (state.formationState) {
-                ReactorControllerFormationState.FORMED -> "formed"
-                ReactorControllerFormationState.NOT_FORMED -> "not formed"
-                ReactorControllerFormationState.UNKNOWN -> "unknown"
-            },
-            structureId = state.structureId?.value?.toString() ?: state.diagnostic,
-            active = formed,
+            status = state.formationState.label(),
+            active = state.formationState == ReactorControllerFormationState.FORMED,
+            nativeBinding = state.nativeBinding,
             zoneCount = state.zoneCount,
             chamberBlocks = state.chamberBlockCount,
             portCount = state.portCount,
+            zones = state.zones.map { it.toUiSnapshot() },
         )
     }
+
+    private fun controllerState(): ReactorControllerViewState =
+        clientControllerBlockEntity()?.controllerScreenState() ?: menu.state
+
+    private fun clientControllerBlockEntity(): ReactorMultiblockBlockEntity? {
+        val position = menu.controllerPos ?: return null
+        return minecraft?.level?.getBlockEntity(position) as? ReactorMultiblockBlockEntity
+    }
+
+    private fun ReactorZoneViewState.toUiSnapshot(): ReactorZoneUiSnapshot =
+        ReactorZoneUiSnapshot(
+            index = index,
+            temperature = formatTemperature(temperatureKelvin),
+            pressure = formatPressure(pressurePascal),
+            mixture =
+                mixture.map { entry ->
+                    ReactorMixtureUiLine(
+                        substanceId = entry.substanceId,
+                        concentration = formatNumber(entry.concentrationMolPerBucket),
+                    )
+                },
+        )
+
+    private fun ReactorControllerFormationState.label(): String =
+        when (this) {
+            ReactorControllerFormationState.FORMED -> "formed"
+            ReactorControllerFormationState.NOT_FORMED -> "not formed"
+            ReactorControllerFormationState.UNKNOWN -> "unknown"
+        }
+
+    private fun formatTemperature(value: Double?): String =
+        value?.let { "${formatNumber(it)} K" } ?: "temperature n/a"
+
+    private fun formatPressure(value: Double?): String =
+        value?.let { "${formatNumber(it / 1000.0)} kPa" } ?: "pressure n/a"
+
+    private fun formatNumber(value: Double): String =
+        when {
+            value == 0.0 -> "0"
+            kotlin.math.abs(value) >= 1000.0 -> String.format(Locale.ROOT, "%.0f", value)
+            kotlin.math.abs(value) >= 10.0 -> String.format(Locale.ROOT, "%.1f", value)
+            else -> String.format(Locale.ROOT, "%.3f", value)
+        }
 }
